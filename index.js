@@ -7,18 +7,16 @@ const mineflayer = require('mineflayer');
 const express = require('express');
 const cookieParser = require('cookie-parser');
 
-// ====================== Configuration ======================
 const CONFIG_FILE = path.join(__dirname, 'server.json');
 const WEB_PORT = process.env.PORT || process.env.SERVER_PORT || 8080;
 const PANEL_PASSWORD = process.env.PANEL_PASSWORD || 'admin';
-const AUTH_TOKEN = Math.random().toString(36).substring(2, 15); // Random session token per boot
+const AUTH_TOKEN = Math.random().toString(36).substring(2, 15);
 
 const DEFAULT_FALLBACK_VERSIONS = [false, '1.20.4', '1.20.1', '1.19.2', '1.18.2'];
 
 let serverGroups = new Map();
 let systemLogs = [];
 
-// ====================== Utilities ======================
 function logWithTime(label, msg) {
   const now = new Date().toISOString().replace('T', ' ').split('.')[0];
   const logStr = `[${now}] [${label}] ${msg}`;
@@ -60,7 +58,6 @@ function saveConfig(config) {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
 }
 
-// ====================== Virtual Client Logic ======================
 class ClientInstance {
   constructor(serverConfig, idLabel) {
     this.config = serverConfig;
@@ -75,8 +72,15 @@ class ClientInstance {
     this.currentVersionIdx = 0;
   }
 
-  async start() {
+  async start(delayMs = 0) {
     if (this.shuttingDown) return;
+    
+    if (delayMs > 0) {
+        logWithTime(this.label, `Queued for connection (Waiting ${(delayMs/1000).toFixed(1)}s)...`);
+        await new Promise(r => setTimeout(r, delayMs));
+    }
+    if (this.shuttingDown) return;
+
     const reachable = await tcpPing(this.config.host, this.config.port);
     if (!reachable) {
       logWithTime(this.label, 'Error: Host unreachable. Retrying...');
@@ -90,18 +94,16 @@ class ClientInstance {
     if (this.reconnecting || this.shuttingDown) return;
     const version = this.fallbackVersions[this.currentVersionIdx];
     
-    // Core memory/CPU optimization
     const options = {
       host: this.config.host,
       port: parseInt(this.config.port, 10) || 25565,
       username: this.username,
       version: version,
       physicsEnabled: false, 
-      viewDistance: 'tiny',
       hideErrors: true
     };
 
-    logWithTime(this.label, `Initializing session: ${this.username} (Protocol: ${version || 'Auto'})`);
+    logWithTime(this.label, `Connecting: ${this.username} (Proto: ${version || 'Auto'})`);
     this.bot = mineflayer.createBot(options);
 
     this.bot.on('login', () => {
@@ -125,12 +127,17 @@ class ClientInstance {
     });
     
     this.bot.on('kicked', (reason) => {
-      logWithTime(this.label, `Session terminated by host`);
-      this.scheduleReconnect();
+      const msg = String(reason);
+      logWithTime(this.label, `Terminated by host: ${msg.replace(/§[0-9a-fk-or]/ig, '').substring(0, 50)}`);
+      
+      if (msg.toLowerCase().includes('throttle') || msg.toLowerCase().includes('rate limit')) {
+          this.scheduleReconnect(30000);
+      } else {
+          this.scheduleReconnect();
+      }
     });
   }
 
-  // Covert background activity every 2.5 minutes (150s)
   startActivityLoop() {
     if (this.activityTimer) clearInterval(this.activityTimer);
     
@@ -183,7 +190,6 @@ class ClientInstance {
   }
 }
 
-// ====================== Node Group Manager ======================
 class NodeGroup {
   constructor(config) {
     this.id = config.id || Math.random().toString(36).substr(2, 6);
@@ -192,33 +198,42 @@ class NodeGroup {
     this.instances = [];
     this.min = Math.max(1, config.players?.min || 1);
     this.max = Math.max(this.min, config.players?.max || 1);
+    
+    this.targetNodes = this.min; 
+    this.lastTargetUpdate = 0;
+    
     this.maintInterval = null;
     this.nextNodeId = 1;
   }
 
   start() {
-    logWithTime('SYSTEM', `Cluster started [${this.label}] (Target nodes: ${this.min}-${this.max})`);
-    for (let i = 0; i < this.min; i++) this.addNode();
+    this.updateTarget();
+    logWithTime('SYSTEM', `Cluster started [${this.label}] (Bounds: ${this.min}-${this.max})`);
     this.maintInterval = setInterval(() => this.maintain(), 15000);
+    this.maintain();
   }
-
-  addNode() {
-    const node = new ClientInstance(this.config, `${this.label}-#${this.nextNodeId++}`);
-    this.instances.push(node);
-    node.start();
+  
+  updateTarget() {
+      if (Date.now() - this.lastTargetUpdate > 300000) {
+          this.targetNodes = Math.floor(Math.random() * (this.max - this.min + 1)) + this.min;
+          this.lastTargetUpdate = Date.now();
+          logWithTime(this.label, `Adjusted cluster target to ${this.targetNodes} nodes.`);
+      }
   }
 
   maintain() {
+    this.updateTarget();
     const alive = this.instances.filter(b => !b.shuttingDown);
-    if (alive.length < this.min) {
-      const need = this.min - alive.length;
-      for (let i = 0; i < need; i++) this.addNode();
-    } else if (alive.length > this.max) {
-      const surplus = alive.slice(this.max);
-      surplus.forEach(b => {
-          b.shutdown();
-          this.instances = this.instances.filter(inst => inst !== b);
-      });
+    
+    if (alive.length < this.targetNodes) {
+      const node = new ClientInstance(this.config, `${this.label}-#${this.nextNodeId++}`);
+      this.instances.push(node);
+      node.start(2000);
+    } 
+    else if (alive.length > this.targetNodes) {
+      const surplus = alive[alive.length - 1];
+      surplus.shutdown();
+      this.instances = this.instances.filter(inst => inst !== surplus);
     }
   }
 
@@ -243,18 +258,15 @@ function reloadClusters() {
   saveConfig(configs);
 }
 
-// ====================== Web Dashboard (Mac Style) ======================
 const app = express();
 app.use(express.json());
 app.use(cookieParser());
 
-// Auth Middleware
 const requireAuth = (req, res, next) => {
   if (req.cookies.auth_token === AUTH_TOKEN) return next();
   res.status(401).json({ error: 'Unauthorized' });
 };
 
-// Login Route
 app.post('/api/login', (req, res) => {
   if (req.body.password === PANEL_PASSWORD) {
     res.cookie('auth_token', AUTH_TOKEN, { maxAge: 86400000, httpOnly: true });
@@ -269,7 +281,6 @@ app.post('/api/logout', (req, res) => {
   res.json({ success: true });
 });
 
-// API Routes (Protected)
 app.get('/api/status', requireAuth, (req, res) => {
   const status = Array.from(serverGroups.values()).map(g => ({
     id: g.id,
@@ -277,6 +288,7 @@ app.get('/api/status', requireAuth, (req, res) => {
     port: g.config.port,
     min: g.min,
     max: g.max,
+    target: g.targetNodes,
     online: g.instances.filter(b => b.bot?.entity && !b.shuttingDown).length,
     total: g.instances.filter(b => !b.shuttingDown).length
   }));
@@ -285,18 +297,14 @@ app.get('/api/status', requireAuth, (req, res) => {
 
 app.post('/api/servers', requireAuth, (req, res) => {
   const configs = loadConfig();
-  const newServer = {
+  configs.push({
     id: Math.random().toString(36).substr(2, 6),
     host: req.body.host || 'localhost',
     port: parseInt(req.body.port) || 25565,
     username: req.body.username || '',
     version: req.body.version === 'auto' ? false : req.body.version,
-    players: {
-      min: parseInt(req.body.min) || 1,
-      max: parseInt(req.body.max) || 1
-    }
-  };
-  configs.push(newServer);
+    players: { min: parseInt(req.body.min) || 1, max: parseInt(req.body.max) || 1 }
+  });
   saveConfig(configs);
   reloadClusters();
   res.json({ success: true });
@@ -310,7 +318,6 @@ app.delete('/api/servers/:id', requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
-// UI Render
 app.get('/', (req, res) => {
   const isAuthenticated = req.cookies.auth_token === AUTH_TOKEN;
   
@@ -320,119 +327,133 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Session Manager</title>
-    <!-- Clean Minimalist SVG Favicon -->
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%231c1c1e'/><circle cx='50' cy='50' r='20' fill='%230a84ff'/><circle cx='50' cy='50' r='10' fill='%231c1c1e'/></svg>">
+    <title>Session Manager Console</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%231e293b'/><circle cx='50' cy='50' r='20' fill='%2338bdf8'/><circle cx='50' cy='50' r='10' fill='%230f172a'/></svg>">
     <style>
         :root {
-            --bg: #000000;
-            --surface: rgba(28, 28, 30, 0.7);
-            --border: rgba(255, 255, 255, 0.1);
-            --text: #f5f5f7;
-            --text-muted: #86868b;
-            --primary: #0a84ff;
-            --danger: #ff453a;
-            --success: #32d74b;
+            --primary: #38bdf8;
+            --primary-hover: #0284c7;
+            --surface: rgba(30, 41, 59, 0.65);
+            --border: rgba(255, 255, 255, 0.08);
+            --text: #f8fafc;
+            --text-muted: #94a3b8;
+            --danger: #fb7185;
+            --success: #34d399;
         }
+        
         body {
             font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background: var(--bg);
-            color: var(--text);
-            margin: 0;
-            padding: 40px 20px;
+            margin: 0; padding: 40px 20px; color: var(--text);
+            min-height: 100vh;
+            background-color: #0f172a;
+            background-image: 
+                radial-gradient(at 10% 10%, rgba(56, 189, 248, 0.15) 0px, transparent 50%),
+                radial-gradient(at 90% 90%, rgba(139, 92, 246, 0.15) 0px, transparent 50%),
+                radial-gradient(at 50% 50%, rgba(15, 23, 42, 1) 0px, transparent 100%);
+            background-attachment: fixed;
             -webkit-font-smoothing: antialiased;
         }
-        .container { max-width: 1000px; margin: 0 auto; }
+
+        .container { max-width: 1050px; margin: 0 auto; }
         
-        /* Mac Window Frame Style */
-        .mac-window {
+        .glass-panel {
             background: var(--surface);
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
             border: 1px solid var(--border);
-            border-radius: 12px;
-            overflow: hidden;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.4);
-            margin-bottom: 24px;
+            border-radius: 16px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            overflow: hidden; margin-bottom: 24px;
         }
-        .mac-header {
-            background: rgba(255,255,255,0.05);
-            padding: 12px 16px;
-            display: flex;
-            align-items: center;
+        
+        .panel-header {
+            background: rgba(255, 255, 255, 0.03);
+            padding: 14px 20px; display: flex; align-items: center;
             border-bottom: 1px solid var(--border);
         }
-        .mac-dots { display: flex; gap: 8px; flex: 1; }
+        .dots { display: flex; gap: 8px; flex: 1; }
         .dot { width: 12px; height: 12px; border-radius: 50%; }
-        .dot.red { background: #ff5f56; }
-        .dot.yellow { background: #ffbd2e; }
-        .dot.green { background: #27c93f; }
-        .mac-title { flex: 2; text-align: center; font-weight: 500; font-size: 14px; color: var(--text-muted); }
-        .mac-spacer { flex: 1; text-align: right; }
+        .dot.red { background: #ff5f56; box-shadow: 0 0 10px rgba(255,95,86,0.4); }
+        .dot.yellow { background: #ffbd2e; box-shadow: 0 0 10px rgba(255,189,46,0.4); }
+        .dot.green { background: #27c93f; box-shadow: 0 0 10px rgba(39,201,63,0.4); }
+        .title { flex: 2; text-align: center; font-weight: 500; font-size: 14px; letter-spacing: 0.5px; color: var(--text-muted); }
+        .spacer { flex: 1; text-align: right; }
 
-        .mac-content { padding: 20px; }
+        .content { padding: 24px; }
 
-        /* General UI */
         .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
         .card {
-            background: rgba(255,255,255,0.03);
+            background: rgba(255, 255, 255, 0.02);
             border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 16px;
-            transition: all 0.2s;
+            border-radius: 12px; padding: 18px;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         }
-        .card:hover { background: rgba(255,255,255,0.06); }
-        h3 { margin: 0 0 12px 0; font-size: 16px; font-weight: 600; display: flex; align-items: center; justify-content: space-between; }
-        p { margin: 6px 0; font-size: 13px; color: var(--text-muted); }
+        .card:hover { 
+            background: rgba(255, 255, 255, 0.05); 
+            transform: translateY(-2px);
+            border-color: rgba(56, 189, 248, 0.3);
+            box-shadow: 0 10px 30px -10px rgba(0,0,0,0.5);
+        }
+        
+        h3 { margin: 0 0 14px 0; font-size: 16px; font-weight: 600; }
+        p { margin: 8px 0; font-size: 13px; color: var(--text-muted); }
         
         input {
-            width: 100%; padding: 10px 12px; margin-top: 4px;
-            background: rgba(0,0,0,0.3); border: 1px solid var(--border);
+            width: 100%; padding: 10px 14px; margin-top: 6px;
+            background: rgba(0,0,0,0.2); border: 1px solid var(--border);
             color: var(--text); border-radius: 8px; box-sizing: border-box;
             font-family: inherit; font-size: 14px; outline: none; transition: border 0.2s;
         }
-        input:focus { border-color: var(--primary); }
-        .form-group { margin-bottom: 12px; }
-        .form-group label { font-size: 12px; font-weight: 500; color: var(--text-muted); }
+        input:focus { border-color: var(--primary); background: rgba(0,0,0,0.3); }
+        .form-group { margin-bottom: 14px; }
+        .form-group label { font-size: 12px; font-weight: 500; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
 
         button {
-            background: var(--primary); color: white; border: none;
-            padding: 10px 16px; border-radius: 8px; font-weight: 500;
+            background: var(--primary); color: #0f172a; border: none;
+            padding: 10px 16px; border-radius: 8px; font-weight: 600;
             cursor: pointer; transition: all 0.2s; font-size: 14px; width: 100%;
         }
-        button:hover { filter: brightness(1.1); transform: translateY(-1px); }
-        button.danger { background: rgba(255, 69, 58, 0.15); color: var(--danger); border: 1px solid rgba(255,69,58,0.3); }
+        button:hover { background: var(--primary-hover); color: #fff; }
+        button.danger { background: rgba(251, 113, 133, 0.1); color: var(--danger); border: 1px solid rgba(251, 113, 133, 0.2); }
         button.danger:hover { background: var(--danger); color: white; }
         button.text-btn { background: transparent; color: var(--text-muted); width: auto; padding: 4px 8px; font-size: 12px; }
-        button.text-btn:hover { color: var(--text); transform: none; }
+        button.text-btn:hover { color: var(--text); }
 
         .terminal {
-            background: #000; padding: 16px; border-radius: 8px;
-            height: 250px; overflow-y: auto; font-family: "Menlo", "Monaco", "Courier New", monospace;
-            font-size: 12px; color: #a1a1aa; border: 1px solid var(--border);
-            line-height: 1.5;
+            background: rgba(0,0,0,0.4); padding: 16px; border-radius: 12px;
+            height: 280px; overflow-y: auto; font-family: "JetBrains Mono", "Menlo", monospace;
+            font-size: 12px; color: #cbd5e1; border: 1px solid var(--border);
+            line-height: 1.6; box-shadow: inset 0 2px 10px rgba(0,0,0,0.2);
+        }
+        
+        .status-badge {
+            display: inline-flex; align-items: center;
+            background: rgba(0,0,0,0.3); padding: 4px 10px;
+            border-radius: 20px; font-size: 12px; font-weight: 500;
         }
         .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-        .dot-on { background: var(--success); box-shadow: 0 0 8px var(--success); }
-        .dot-off { background: var(--danger); }
+        .dot-on { background: var(--success); box-shadow: 0 0 10px var(--success); }
+        .dot-off { background: var(--danger); box-shadow: 0 0 10px var(--danger); }
+        .dot-sync { background: var(--primary); box-shadow: 0 0 10px var(--primary); animation: pulse 2s infinite; }
         
-        /* Login screen specifics */
-        .login-box { max-width: 320px; margin: 100px auto; text-align: center; }
-        .login-box svg { width: 64px; height: 64px; margin-bottom: 24px; }
+        @keyframes pulse {
+            0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; }
+        }
+
+        .login-box { max-width: 340px; margin: 12vh auto; text-align: center; }
     </style>
 </head>
 <body>
     ${!isAuthenticated ? `
-    <!-- LOGIN SCREEN -->
-    <div class="mac-window login-box">
-        <div class="mac-header">
-            <div class="mac-dots"><div class="dot red"></div><div class="dot yellow"></div><div class="dot green"></div></div>
-            <div class="mac-title">Auth</div><div class="mac-spacer"></div>
+    <div class="glass-panel login-box">
+        <div class="panel-header">
+            <div class="dots"><div class="dot red"></div><div class="dot yellow"></div><div class="dot green"></div></div>
+            <div class="title">Secure Auth</div><div class="spacer"></div>
         </div>
-        <div class="mac-content">
-            <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='rgba(255,255,255,0.05)'/><circle cx='50' cy='50' r='20' fill='#0a84ff'/><circle cx='50' cy='50' r='10' fill='#1c1c1e'/></svg>
-            <h2 style="margin:0 0 20px 0; font-size:18px;">Session Manager</h2>
-            <input type="password" id="pass" placeholder="Enter security key" style="margin-bottom: 16px; text-align:center;">
+        <div class="content" style="padding: 32px 24px;">
+            <svg style="width:56px; height:56px; margin-bottom:20px;" xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='rgba(255,255,255,0.05)'/><circle cx='50' cy='50' r='20' fill='#38bdf8'/><circle cx='50' cy='50' r='10' fill='#0f172a'/></svg>
+            <h2 style="margin:0 0 24px 0; font-size:18px; font-weight:500;">Core Access</h2>
+            <input type="password" id="pass" placeholder="Encryption Key" style="margin-bottom: 20px; text-align:center; letter-spacing:2px;">
             <button onclick="login()">Authenticate</button>
         </div>
     </div>
@@ -448,42 +469,43 @@ app.get('/', (req, res) => {
         document.getElementById('pass').addEventListener('keypress', e => { if(e.key === 'Enter') login(); });
     </script>
     ` : `
-    <!-- DASHBOARD SCREEN -->
     <div class="container">
-        <div class="mac-window">
-            <div class="mac-header">
-                <div class="mac-dots"><div class="dot red"></div><div class="dot yellow"></div><div class="dot green"></div></div>
-                <div class="mac-title">Session Manager Overview</div>
-                <div class="mac-spacer"><button class="text-btn" onclick="logout()">Lock</button></div>
+        <div class="glass-panel">
+            <div class="panel-header">
+                <div class="dots"><div class="dot red"></div><div class="dot yellow"></div><div class="dot green"></div></div>
+                <div class="title">Session Manager Framework</div>
+                <div class="spacer"><button class="text-btn" onclick="logout()">Lock Session</button></div>
             </div>
             
-            <div class="mac-content">
+            <div class="content">
                 <div style="display: flex; gap: 24px; flex-wrap: wrap;">
                     
+                    <!-- 左侧节点列表 -->
                     <div style="flex: 2; min-width: 280px;">
-                        <h3 style="margin-bottom: 16px; color: var(--text-muted); font-size: 13px; text-transform: uppercase; letter-spacing: 1px;">Active Clusters</h3>
-                        <div class="grid" id="server-list"><span style="color:#666;font-size:13px;">Loading data...</span></div>
+                        <h3 style="color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 1px;">Active Clusters</h3>
+                        <div class="grid" id="server-list"><span style="color:var(--text-muted); font-size:13px;">Establishing connection...</span></div>
                     </div>
 
+                    <!-- 右侧部署面板 -->
                     <div style="flex: 1; min-width: 260px;">
-                        <div class="card" style="background: rgba(10, 132, 255, 0.05); border-color: rgba(10, 132, 255, 0.2);">
-                            <h3 style="color: var(--primary);">Deploy New Cluster</h3>
-                            <div class="form-group"><label>Target Host</label><input type="text" id="add-host" placeholder="node.example.com"></div>
-                            <div style="display: flex; gap: 10px;">
+                        <div class="card" style="background: rgba(56, 189, 248, 0.03); border-color: rgba(56, 189, 248, 0.2);">
+                            <h3 style="color: var(--primary);">Deploy Subsystem</h3>
+                            <div class="form-group"><label>Host Address</label><input type="text" id="add-host" placeholder="node.example.com"></div>
+                            <div style="display: flex; gap: 12px;">
                                 <div class="form-group" style="flex:2"><label>Port</label><input type="number" id="add-port" value="25565"></div>
                                 <div class="form-group" style="flex:1"><label>Base ID</label><input type="text" id="add-user" placeholder="Opt"></div>
                             </div>
-                            <div style="display: flex; gap: 10px;">
-                                <div class="form-group" style="flex:1"><label>Min Nodes</label><input type="number" id="add-min" value="1"></div>
-                                <div class="form-group" style="flex:1"><label>Max Nodes</label><input type="number" id="add-max" value="1"></div>
+                            <div style="display: flex; gap: 12px;">
+                                <div class="form-group" style="flex:1"><label>Min Units</label><input type="number" id="add-min" value="1"></div>
+                                <div class="form-group" style="flex:1"><label>Max Units</label><input type="number" id="add-max" value="3"></div>
                             </div>
-                            <button onclick="addServer()" style="margin-top: 8px;">Initialize Subsystem</button>
+                            <button onclick="addServer()" style="margin-top: 8px;">Initialize Instance</button>
                         </div>
                     </div>
                 </div>
 
-                <div style="margin-top: 32px;">
-                    <h3 style="margin-bottom: 12px; color: var(--text-muted); font-size: 13px; text-transform: uppercase; letter-spacing: 1px;">System Output Stream</h3>
+                <div style="margin-top: 36px;">
+                    <h3 style="color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 1px;">System Output Stream</h3>
                     <div class="terminal" id="logs">Booting up framework...</div>
                 </div>
             </div>
@@ -498,31 +520,43 @@ app.get('/', (req, res) => {
                 const data = await res.json();
                 
                 const list = document.getElementById('server-list');
-                if(data.servers.length === 0) list.innerHTML = '<p>No active clusters running.</p>';
+                if(data.servers.length === 0) list.innerHTML = '<p style="color:var(--text-muted)">No clusters deployed yet.</p>';
                 else {
-                    list.innerHTML = data.servers.map(s => \`
+                    list.innerHTML = data.servers.map(s => {
+                        // 判断状态灯
+                        let dotClass = 'dot-off';
+                        let statusText = 'Offline';
+                        if (s.online > 0 && s.online >= s.target) { dotClass = 'dot-on'; statusText = 'Optimal'; }
+                        else if (s.online > 0) { dotClass = 'dot-sync'; statusText = 'Syncing...'; }
+
+                        return \`
                         <div class="card">
-                            <h3>\${s.host}<span style="font-size:12px;color:var(--text-muted);font-weight:normal;">:\${s.port}</span></h3>
-                            <div style="display:flex; justify-content:space-between; align-items:center; margin: 12px 0;">
-                                <span style="font-size:13px;"><span class="status-dot \${s.online >= s.min ? 'dot-on' : 'dot-off'}"></span>Nodes Linked</span>
-                                <span style="font-family:monospace; font-size:14px; background:rgba(0,0,0,0.5); padding:2px 6px; border-radius:4px;">\${s.online} / \${s.total}</span>
+                            <h3 style="margin-bottom:6px;">\${s.host}<span style="font-size:12px;color:var(--text-muted);font-weight:normal;">:\${s.port}</span></h3>
+                            
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin: 16px 0;">
+                                <div class="status-badge"><span class="status-dot \${dotClass}"></span>\${statusText}</div>
+                                <div style="text-align:right;">
+                                    <span style="font-size:18px; font-weight:600; color:var(--text);">\${s.online}</span>
+                                    <span style="font-size:12px; color:var(--text-muted);">/ Target \${s.target}</span>
+                                </div>
                             </div>
-                            <p>Capacity bounds: \${s.min} - \${s.max} units</p>
-                            <button class="danger" style="margin-top: 10px; padding: 6px;" onclick="delServer('\${s.id}')">Terminate Cluster</button>
+                            
+                            <p style="font-size:12px;">Dynamic Bounds: \${s.min} ~ \${s.max} units</p>
+                            <button class="danger" style="margin-top: 12px; padding: 8px;" onclick="delServer('\${s.id}')">Terminate Cluster</button>
                         </div>
-                    \`).join('');
+                    \`}).join('');
                 }
 
                 const logBox = document.getElementById('logs');
                 const wasAtBottom = logBox.scrollHeight - logBox.clientHeight <= logBox.scrollTop + 10;
-                logBox.innerHTML = data.logs.map(l => \`<div style="margin-bottom:4px;">\${l}</div>\`).join('');
+                logBox.innerHTML = data.logs.map(l => \`<div style="margin-bottom:6px; border-bottom:1px solid rgba(255,255,255,0.05); padding-bottom:4px;">\${l}</div>\`).join('');
                 if (wasAtBottom) logBox.scrollTop = logBox.scrollHeight;
             } catch(e) {}
         }
 
         async function addServer() {
             const host = document.getElementById('add-host').value;
-            if (!host) return alert('Target Host is required.');
+            if (!host) return alert('Host is required.');
             await fetch('/api/servers', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
@@ -537,7 +571,7 @@ app.get('/', (req, res) => {
         }
 
         async function delServer(id) {
-            if(!confirm('Confirm termination of this entire cluster? All connected nodes will be dropped instantly.')) return;
+            if(!confirm('Confirm termination of this entire cluster?')) return;
             await fetch(\`/api/servers/\${id}\`, { method: 'DELETE' });
             fetchStatus();
         }
@@ -557,7 +591,6 @@ app.get('/', (req, res) => {
   res.send(html);
 });
 
-// ====================== Boot Sequence ======================
 app.listen(WEB_PORT, '0.0.0.0', () => {
   console.log(`\n===========================================`);
   console.log(`🚀 Kernel loaded on port: ${WEB_PORT}`);
