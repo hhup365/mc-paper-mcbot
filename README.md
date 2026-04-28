@@ -80,11 +80,16 @@ node index.js
 
 ### 远程配置（可选）
 
-设置环境变量 `SERVER_API` 指向你的 JSON 配置文件地址、 `SERVER_1/2/3` ：
+设置环境变量 `SERVER_API` 指向你的 JSON 配置文件地址：
 
 ```bash
 export SERVER_API="https://your-cdn.com/server.json"
 node index.js
+```
+设置环境变量 `SERVER_1`来快速配置地址：
+
+```bash
+SERVER_1=host:port[:version]
 ```
 
 启动时会先下载远程 `server.json` 覆盖本地，然后加载。之后每次重启容器或进程都会拉取最新配置，实现集中管理。
