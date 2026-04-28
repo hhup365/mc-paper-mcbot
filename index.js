@@ -4,30 +4,35 @@ const fs = require('fs');
 const path = require('path');
 const net = require('net');
 const mineflayer = require('mineflayer');
+const express = require('express');
+const cookieParser = require('cookie-parser');
 
-// ====================== 配置 ======================
+// ====================== Configuration ======================
 const CONFIG_FILE = path.join(__dirname, 'server.json');
-const DEFAULT_SERVER_API = process.env.SERVER_API || '';
+const WEB_PORT = process.env.PORT || process.env.SERVER_PORT || 8080;
+const PANEL_PASSWORD = process.env.PANEL_PASSWORD || 'admin';
+const AUTH_TOKEN = Math.random().toString(36).substring(2, 15); // Random session token per boot
 
-// 版本回退列表
 const DEFAULT_FALLBACK_VERSIONS = [false, '1.20.4', '1.20.1', '1.19.2', '1.18.2'];
 
-// ====================== 工具函数 ======================
+let serverGroups = new Map();
+let systemLogs = [];
+
+// ====================== Utilities ======================
 function logWithTime(label, msg) {
   const now = new Date().toISOString().replace('T', ' ').split('.')[0];
-  console.log(`[${now}] [${label}] ${msg}`);
+  const logStr = `[${now}] [${label}] ${msg}`;
+  console.log(logStr);
+  
+  systemLogs.push(logStr);
+  if (systemLogs.length > 200) systemLogs.shift();
 }
 
-function randomBetween(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-function generateUsername() {
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789_';
-  const length = randomBetween(6, 10);
-  let name = '';
-  for (let i = 0; i < length; i++) name += chars[Math.floor(Math.random() * chars.length)];
-  if (/^\d/.test(name)) name = 'p' + name.slice(1);
+function generateUsername(base) {
+  if (base) return base;
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let name = 'C_';
+  for (let i = 0; i < 6; i++) name += chars[Math.floor(Math.random() * chars.length)];
   return name;
 }
 
@@ -42,375 +47,529 @@ function tcpPing(host, port, timeout = 2000) {
   });
 }
 
-// ====================== 配置加载 ======================
-function parseEnvServers() {
-  const servers = [];
-  for (let i = 1; ; i++) {
-    const raw = process.env[`SERVER_${i}`];
-    if (!raw) break;
-    const parts = raw.split(':');
-    if (parts.length < 2) continue;
-    const host = parts[0];
-    const port = parseInt(parts[1], 10) || 25565;
-    let version = false;
-    if (parts.length >= 3) {
-      const v = parts[2];
-      if (v === 'auto' || v === 'false' || v === '') version = false;
-      else version = v;
-    }
-    servers.push({
-      host,
-      port,
-      username: '',
-      version,
-      players: { min: 1, max: 1 }
-    });
-  }
-  return servers;
-}
-
-function loadConfigFile() {
+function loadConfig() {
   if (!fs.existsSync(CONFIG_FILE)) {
-    const template = [
-      {
-        host: 'server1.example.com',
-        port: 25565,
-        username: '',
-        version: false,
-        players: { min: 1, max: 1 },
-        fallbackVersions: [false, '1.20.1', '1.19.2']
-      }
-    ];
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(template, null, 2), 'utf-8');
-    console.log('✅ 已生成 server.json 模板，请编辑后重新启动');
-    process.exit(0);
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify([], null, 2), 'utf-8');
+    return [];
   }
-  return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')); } 
+  catch (e) { return []; }
 }
 
-async function fetchRemoteConfig(url) {
-  try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(data, null, 2), 'utf-8');
-    console.log('✅ 已从远程更新 server.json');
-    return data;
-  } catch (err) {
-    console.error('❌ 远程配置下载失败:', err.message);
-    return null;
-  }
+function saveConfig(config) {
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
 }
 
-// ====================== 极简 Bot 实例 ======================
-class BotInstance {
-  constructor(serverConfig, label) {
+// ====================== Virtual Client Logic ======================
+class ClientInstance {
+  constructor(serverConfig, idLabel) {
     this.config = serverConfig;
-    this.label = label || `${serverConfig.host}:${serverConfig.port}`;
+    this.label = idLabel;
     this.bot = null;
     this.reconnecting = false;
     this.shuttingDown = false;
-    this.lastActivity = Date.now();
     this.activityTimer = null;
-    this.monitorTimer = null;
     this.retryCount = 0;
-    this.maxRetryDelay = 300000;
-    this.baseRetryDelay = 10000;
-
-    this.username = this.config.username?.trim() || generateUsername();
-
-    this.fallbackVersions = Array.isArray(this.config.fallbackVersions)
-      ? this.config.fallbackVersions
-      : DEFAULT_FALLBACK_VERSIONS;
+    this.username = generateUsername(this.config.username);
+    this.fallbackVersions = Array.isArray(this.config.fallbackVersions) ? this.config.fallbackVersions : DEFAULT_FALLBACK_VERSIONS;
     this.currentVersionIdx = 0;
-    this.versionInitialized = false;
-  }
-
-  getVersion() {
-    if (!this.versionInitialized) {
-      const v = this.config.version !== undefined ? this.config.version : false;
-      const idx = this.fallbackVersions.findIndex(ver => String(ver) === String(v));
-      this.currentVersionIdx = idx >= 0 ? idx : 0;
-      this.versionInitialized = true;
-    }
-    if (this.currentVersionIdx >= this.fallbackVersions.length) this.currentVersionIdx = 0;
-    return this.fallbackVersions[this.currentVersionIdx];
-  }
-
-  advanceVersion() {
-    this.currentVersionIdx++;
-    if (this.currentVersionIdx >= this.fallbackVersions.length) this.currentVersionIdx = 0;
-    logWithTime(this.label, `🔄 切换版本: ${this.fallbackVersions[this.currentVersionIdx]}`);
   }
 
   async start() {
+    if (this.shuttingDown) return;
     const reachable = await tcpPing(this.config.host, this.config.port);
     if (!reachable) {
-      logWithTime(this.label, '❌ 服务器无法连接，稍后重试');
-      this.scheduleReconnect();
+      logWithTime(this.label, 'Error: Host unreachable. Retrying...');
+      this.scheduleReconnect(15000);
       return;
     }
-    this.createBot();
+    this.createClient();
   }
 
-  createBot() {
+  createClient() {
     if (this.reconnecting || this.shuttingDown) return;
-
-    const version = this.getVersion();
+    const version = this.fallbackVersions[this.currentVersionIdx];
+    
+    // Core memory/CPU optimization
     const options = {
       host: this.config.host,
       port: parseInt(this.config.port, 10) || 25565,
       username: this.username,
-      version,
-      connectTimeout: 12000,
-      keepAlive: true
+      version: version,
+      physicsEnabled: false, 
+      viewDistance: 'tiny',
+      hideErrors: true
     };
 
-    logWithTime(this.label, `启动 Bot: ${this.username} (v: ${version})`);
+    logWithTime(this.label, `Initializing session: ${this.username} (Protocol: ${version || 'Auto'})`);
     this.bot = mineflayer.createBot(options);
 
-    this.bot._client.on('error', (err) => {
-      logWithTime(this.label, `📡 底层错误: ${err.message}`);
-    });
-
-    const timeout = setTimeout(() => {
-      if (this.bot?.end) {
-        logWithTime(this.label, '❌ 连接超时，断开');
-        this.bot.end();
-      }
-    }, 15000);
-
     this.bot.on('login', () => {
-      logWithTime(this.label, `✅ ${this.username} 登录成功`);
-      clearTimeout(timeout);
+      logWithTime(this.label, `Connection established`);
       this.reconnecting = false;
       this.retryCount = 0;
-      this.versionInitialized = true;
-      this.updateActivity();
-      this.startMonitor();
       this.startActivityLoop();
     });
 
     this.bot.on('error', (err) => {
-      logWithTime(this.label, `❌ 错误: ${err.message}`);
-      if (this.isVersionError(err)) this.advanceVersion();
+      const msg = err.message || '';
+      if (msg.includes('protocol version') || msg.includes('decode packet')) {
+        this.currentVersionIdx = (this.currentVersionIdx + 1) % this.fallbackVersions.length;
+      }
       this.scheduleReconnect();
     });
+
     this.bot.on('end', () => {
-      if (!this.shuttingDown) logWithTime(this.label, '🔌 断开连接');
+      if (!this.shuttingDown) logWithTime(this.label, `Connection dropped`);
       this.scheduleReconnect();
     });
+    
     this.bot.on('kicked', (reason) => {
-      logWithTime(this.label, '👢 被踢出:', reason);
-      if (typeof reason === 'string' && this.isVersionError({ message: reason })) this.advanceVersion();
+      logWithTime(this.label, `Session terminated by host`);
       this.scheduleReconnect();
     });
   }
 
-  isVersionError(err) {
-    const msg = err?.message || err?.toString() || '';
-    return msg.includes('FAILED to decode packet') ||
-           msg.includes('Unsupported protocol version') ||
-           msg.includes('connection lost');
-  }
-
-  updateActivity() {
-    this.lastActivity = Date.now();
-  }
-
+  // Covert background activity every 2.5 minutes (150s)
   startActivityLoop() {
     if (this.activityTimer) clearInterval(this.activityTimer);
-    const interval = randomBetween(150000, 180000);
+    
     this.activityTimer = setInterval(() => {
-      if (!this.bot?.entity) return;
-      this.doRandomAction();
-      this.updateActivity();
-    }, interval);
-
-    setTimeout(() => {
-      if (this.bot?.entity) {
-        this.doRandomAction();
-        this.updateActivity();
+      if (!this.bot?.entity || this.shuttingDown) return;
+      
+      const rand = Math.random();
+      if (rand < 0.33) {
+        this.bot.swingArm('right');
+        logWithTime(this.label, 'Activity: Sync state (0x1)');
+      } else if (rand < 0.66) {
+        this.bot.setControlState('sneak', true);
+        setTimeout(() => this.bot.setControlState('sneak', false), 500);
+        logWithTime(this.label, 'Activity: Update pose (0x2)');
+      } else {
+        const yaw = this.bot.entity.yaw + (Math.random() - 0.5);
+        this.bot.look(yaw, this.bot.entity.pitch, true);
+        logWithTime(this.label, 'Activity: Update rotation (0x3)');
       }
-    }, randomBetween(10000, 30000));
+    }, 150000);
   }
 
-  doRandomAction() {
-    const bot = this.bot;
-    if (!bot?.entity) return;
-    if (Math.random() < 0.5) {
-      bot.setControlState('jump', true);
-      setTimeout(() => bot.setControlState('jump', false), 400);
-      logWithTime(this.label, '↕️ 跳跃');
-    } else {
-      const yaw = bot.entity.yaw + (Math.random() - 0.5) * 1.5;
-      bot.look(yaw, bot.entity.pitch, true);
-      logWithTime(this.label, '👀 转向');
-    }
-  }
-
-  startMonitor() {
-    if (this.monitorTimer) clearInterval(this.monitorTimer);
-    this.monitorTimer = setInterval(() => {
-      if (Date.now() - this.lastActivity > 240000) {
-        logWithTime(this.label, '⏱️ 活动超时，强制恢复');
-        if (this.bot?.entity) {
-          this.doRandomAction();
-          this.updateActivity();
-        } else {
-          this.scheduleReconnect();
-        }
-      }
-    }, 30000);
-  }
-
-  scheduleReconnect() {
+  scheduleReconnect(customDelay = null) {
     if (this.reconnecting || this.shuttingDown) return;
     this.reconnecting = true;
     this.cleanup();
-    const base = Math.min(this.baseRetryDelay * Math.pow(2, this.retryCount), this.maxRetryDelay);
-    const delay = Math.max(5000, base + Math.floor(Math.random() * 5000));
+    
     this.retryCount++;
-    logWithTime(this.label, `🔁 ${(delay/1000).toFixed(1)}s 后重连 (第 ${this.retryCount} 次)`);
+    const delay = customDelay || Math.min(10000 * this.retryCount, 120000);
+    logWithTime(this.label, `Reconnecting in ${(delay/1000).toFixed(0)}s...`);
+    
     setTimeout(() => {
       this.reconnecting = false;
-      if (!this.shuttingDown) this.start();
+      this.start();
     }, delay);
   }
 
   cleanup() {
-    if (this.activityTimer) { clearInterval(this.activityTimer); this.activityTimer = null; }
-    if (this.monitorTimer) { clearInterval(this.monitorTimer); this.monitorTimer = null; }
+    if (this.activityTimer) clearInterval(this.activityTimer);
     if (this.bot) {
       this.bot.removeAllListeners();
-      if (typeof this.bot.quit === 'function') this.bot.quit();
+      try { this.bot.quit(); } catch(e){}
       this.bot = null;
     }
   }
 
   shutdown() {
     this.shuttingDown = true;
-    logWithTime(this.label, `🛑 关闭 ${this.username}`);
     this.cleanup();
   }
 }
 
-// ====================== 服务器组管理器 ======================
-class ServerGroup {
-  constructor(config, index) {
+// ====================== Node Group Manager ======================
+class NodeGroup {
+  constructor(config) {
+    this.id = config.id || Math.random().toString(36).substr(2, 6);
     this.config = config;
     this.label = `${config.host}:${config.port}`;
     this.instances = [];
-    this.nextId = 0;
-    this.range = config.players || { min: 1, max: 1 };
-    this.min = Math.max(1, this.range.min);
-    this.max = Math.max(this.min, this.range.max);
+    this.min = Math.max(1, config.players?.min || 1);
+    this.max = Math.max(this.min, config.players?.max || 1);
     this.maintInterval = null;
-    this.swapInterval = null;
+    this.nextNodeId = 1;
   }
 
   start() {
-    for (let i = 0; i < this.min; i++) this.addBot();
-    this.maintInterval = setInterval(() => this.maintain(), 60000);
-    if (this.max > this.min) {
-      this.swapInterval = setInterval(() => this.randomSwap(), randomBetween(600000, 1200000));
-    }
+    logWithTime('SYSTEM', `Cluster started [${this.label}] (Target nodes: ${this.min}-${this.max})`);
+    for (let i = 0; i < this.min; i++) this.addNode();
+    this.maintInterval = setInterval(() => this.maintain(), 15000);
   }
 
-  addBot(name) {
-    const bot = new BotInstance(this.config, `${this.label}-${this.nextId++}`);
-    if (name) bot.username = name;
-    else bot.username = generateUsername();
-    this.instances.push(bot);
-    bot.start();
-    return bot;
-  }
-
-  removeBot(bot) {
-    bot.shutdown();
-    this.instances = this.instances.filter(b => b !== bot);
+  addNode() {
+    const node = new ClientInstance(this.config, `${this.label}-#${this.nextNodeId++}`);
+    this.instances.push(node);
+    node.start();
   }
 
   maintain() {
-    const alive = this.instances.filter(b => !b.shuttingDown && b.bot?.entity);
+    const alive = this.instances.filter(b => !b.shuttingDown);
     if (alive.length < this.min) {
       const need = this.min - alive.length;
-      logWithTime(this.label, `👥 补充 ${need} 人`);
-      for (let i = 0; i < need; i++) this.addBot();
+      for (let i = 0; i < need; i++) this.addNode();
     } else if (alive.length > this.max) {
-      const remove = alive.slice(0, alive.length - this.max);
-      remove.forEach(b => this.removeBot(b));
+      const surplus = alive.slice(this.max);
+      surplus.forEach(b => {
+          b.shutdown();
+          this.instances = this.instances.filter(inst => inst !== b);
+      });
     }
-  }
-
-  randomSwap() {
-    const alive = this.instances.filter(b => !b.shuttingDown && b.bot?.entity);
-    if (alive.length === 0) return;
-    const leaver = alive[Math.floor(Math.random() * alive.length)];
-    logWithTime(this.label, `🔄 玩家离开: ${leaver.username}`);
-    this.removeBot(leaver);
-    setTimeout(() => {
-      if (this.instances.filter(b => !b.shuttingDown).length < this.max) {
-        const newBot = this.addBot();
-        logWithTime(this.label, `🆕 新玩家: ${newBot.username}`);
-      }
-    }, randomBetween(20000, 60000));
   }
 
   stop() {
     if (this.maintInterval) clearInterval(this.maintInterval);
-    if (this.swapInterval) clearInterval(this.swapInterval);
     this.instances.forEach(b => b.shutdown());
     this.instances = [];
   }
 }
 
-// ====================== 主流程 ======================
-async function main() {
-  let config;
+function reloadClusters() {
+  const configs = loadConfig();
+  for (const [id, group] of serverGroups) group.stop();
+  serverGroups.clear();
 
-  // 1. 优先使用环境变量 SERVER_1, SERVER_2 ...
-  const envServers = parseEnvServers();
-  if (envServers.length > 0) {
-    config = envServers;
-    console.log(`✅ 从环境变量加载 ${config.length} 个服务器`);
-  } else {
-    // 2. 尝试远程下载或本地文件
-    const apiUrl = process.env.SERVER_API || DEFAULT_SERVER_API;
-    if (apiUrl) {
-      config = await fetchRemoteConfig(apiUrl);
-      if (!config && !fs.existsSync(CONFIG_FILE)) {
-        console.error('❌ 无法获取配置，退出');
-        process.exit(1);
-      }
-    }
-    if (!config) config = loadConfigFile();
-  }
-
-  if (!Array.isArray(config)) {
-    console.error('❌ server.json 应为数组');
-    process.exit(1);
-  }
-
-  const groups = config.map((cfg, i) => {
-    const g = new ServerGroup(cfg, i);
-    g.start();
-    return g;
+  configs.forEach(cfg => {
+    if (!cfg.id) cfg.id = Math.random().toString(36).substr(2, 6);
+    const group = new NodeGroup(cfg);
+    serverGroups.set(cfg.id, group);
+    group.start();
   });
-
-  const shutdown = () => {
-    console.log('\n🛑 关闭所有 Bot...');
-    groups.forEach(g => g.stop());
-    process.exit(0);
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-  process.on('uncaughtException', (err) => {
-    if (err.code !== 'ECONNRESET') console.error('未捕获异常:', err.message);
-  });
-  process.on('unhandledRejection', (r) => {
-    if (r?.code !== 'ECONNRESET') console.error('未处理拒绝:', r);
-  });
+  saveConfig(configs);
 }
 
-main();
+// ====================== Web Dashboard (Mac Style) ======================
+const app = express();
+app.use(express.json());
+app.use(cookieParser());
+
+// Auth Middleware
+const requireAuth = (req, res, next) => {
+  if (req.cookies.auth_token === AUTH_TOKEN) return next();
+  res.status(401).json({ error: 'Unauthorized' });
+};
+
+// Login Route
+app.post('/api/login', (req, res) => {
+  if (req.body.password === PANEL_PASSWORD) {
+    res.cookie('auth_token', AUTH_TOKEN, { maxAge: 86400000, httpOnly: true });
+    res.json({ success: true });
+  } else {
+    res.status(401).json({ error: 'Invalid password' });
+  }
+});
+
+app.post('/api/logout', (req, res) => {
+  res.clearCookie('auth_token');
+  res.json({ success: true });
+});
+
+// API Routes (Protected)
+app.get('/api/status', requireAuth, (req, res) => {
+  const status = Array.from(serverGroups.values()).map(g => ({
+    id: g.id,
+    host: g.config.host,
+    port: g.config.port,
+    min: g.min,
+    max: g.max,
+    online: g.instances.filter(b => b.bot?.entity && !b.shuttingDown).length,
+    total: g.instances.filter(b => !b.shuttingDown).length
+  }));
+  res.json({ servers: status, logs: systemLogs });
+});
+
+app.post('/api/servers', requireAuth, (req, res) => {
+  const configs = loadConfig();
+  const newServer = {
+    id: Math.random().toString(36).substr(2, 6),
+    host: req.body.host || 'localhost',
+    port: parseInt(req.body.port) || 25565,
+    username: req.body.username || '',
+    version: req.body.version === 'auto' ? false : req.body.version,
+    players: {
+      min: parseInt(req.body.min) || 1,
+      max: parseInt(req.body.max) || 1
+    }
+  };
+  configs.push(newServer);
+  saveConfig(configs);
+  reloadClusters();
+  res.json({ success: true });
+});
+
+app.delete('/api/servers/:id', requireAuth, (req, res) => {
+  let configs = loadConfig();
+  configs = configs.filter(c => c.id !== req.params.id);
+  saveConfig(configs);
+  reloadClusters();
+  res.json({ success: true });
+});
+
+// UI Render
+app.get('/', (req, res) => {
+  const isAuthenticated = req.cookies.auth_token === AUTH_TOKEN;
+  
+  const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Session Manager</title>
+    <!-- Clean Minimalist SVG Favicon -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%231c1c1e'/><circle cx='50' cy='50' r='20' fill='%230a84ff'/><circle cx='50' cy='50' r='10' fill='%231c1c1e'/></svg>">
+    <style>
+        :root {
+            --bg: #000000;
+            --surface: rgba(28, 28, 30, 0.7);
+            --border: rgba(255, 255, 255, 0.1);
+            --text: #f5f5f7;
+            --text-muted: #86868b;
+            --primary: #0a84ff;
+            --danger: #ff453a;
+            --success: #32d74b;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            margin: 0;
+            padding: 40px 20px;
+            -webkit-font-smoothing: antialiased;
+        }
+        .container { max-width: 1000px; margin: 0 auto; }
+        
+        /* Mac Window Frame Style */
+        .mac-window {
+            background: var(--surface);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+            margin-bottom: 24px;
+        }
+        .mac-header {
+            background: rgba(255,255,255,0.05);
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            border-bottom: 1px solid var(--border);
+        }
+        .mac-dots { display: flex; gap: 8px; flex: 1; }
+        .dot { width: 12px; height: 12px; border-radius: 50%; }
+        .dot.red { background: #ff5f56; }
+        .dot.yellow { background: #ffbd2e; }
+        .dot.green { background: #27c93f; }
+        .mac-title { flex: 2; text-align: center; font-weight: 500; font-size: 14px; color: var(--text-muted); }
+        .mac-spacer { flex: 1; text-align: right; }
+
+        .mac-content { padding: 20px; }
+
+        /* General UI */
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+        .card {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 16px;
+            transition: all 0.2s;
+        }
+        .card:hover { background: rgba(255,255,255,0.06); }
+        h3 { margin: 0 0 12px 0; font-size: 16px; font-weight: 600; display: flex; align-items: center; justify-content: space-between; }
+        p { margin: 6px 0; font-size: 13px; color: var(--text-muted); }
+        
+        input {
+            width: 100%; padding: 10px 12px; margin-top: 4px;
+            background: rgba(0,0,0,0.3); border: 1px solid var(--border);
+            color: var(--text); border-radius: 8px; box-sizing: border-box;
+            font-family: inherit; font-size: 14px; outline: none; transition: border 0.2s;
+        }
+        input:focus { border-color: var(--primary); }
+        .form-group { margin-bottom: 12px; }
+        .form-group label { font-size: 12px; font-weight: 500; color: var(--text-muted); }
+
+        button {
+            background: var(--primary); color: white; border: none;
+            padding: 10px 16px; border-radius: 8px; font-weight: 500;
+            cursor: pointer; transition: all 0.2s; font-size: 14px; width: 100%;
+        }
+        button:hover { filter: brightness(1.1); transform: translateY(-1px); }
+        button.danger { background: rgba(255, 69, 58, 0.15); color: var(--danger); border: 1px solid rgba(255,69,58,0.3); }
+        button.danger:hover { background: var(--danger); color: white; }
+        button.text-btn { background: transparent; color: var(--text-muted); width: auto; padding: 4px 8px; font-size: 12px; }
+        button.text-btn:hover { color: var(--text); transform: none; }
+
+        .terminal {
+            background: #000; padding: 16px; border-radius: 8px;
+            height: 250px; overflow-y: auto; font-family: "Menlo", "Monaco", "Courier New", monospace;
+            font-size: 12px; color: #a1a1aa; border: 1px solid var(--border);
+            line-height: 1.5;
+        }
+        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+        .dot-on { background: var(--success); box-shadow: 0 0 8px var(--success); }
+        .dot-off { background: var(--danger); }
+        
+        /* Login screen specifics */
+        .login-box { max-width: 320px; margin: 100px auto; text-align: center; }
+        .login-box svg { width: 64px; height: 64px; margin-bottom: 24px; }
+    </style>
+</head>
+<body>
+    ${!isAuthenticated ? `
+    <!-- LOGIN SCREEN -->
+    <div class="mac-window login-box">
+        <div class="mac-header">
+            <div class="mac-dots"><div class="dot red"></div><div class="dot yellow"></div><div class="dot green"></div></div>
+            <div class="mac-title">Auth</div><div class="mac-spacer"></div>
+        </div>
+        <div class="mac-content">
+            <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='rgba(255,255,255,0.05)'/><circle cx='50' cy='50' r='20' fill='#0a84ff'/><circle cx='50' cy='50' r='10' fill='#1c1c1e'/></svg>
+            <h2 style="margin:0 0 20px 0; font-size:18px;">Session Manager</h2>
+            <input type="password" id="pass" placeholder="Enter security key" style="margin-bottom: 16px; text-align:center;">
+            <button onclick="login()">Authenticate</button>
+        </div>
+    </div>
+    <script>
+        async function login() {
+            const res = await fetch('/api/login', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ password: document.getElementById('pass').value })
+            });
+            if(res.ok) window.location.reload();
+            else { alert('Access Denied'); document.getElementById('pass').value = ''; }
+        }
+        document.getElementById('pass').addEventListener('keypress', e => { if(e.key === 'Enter') login(); });
+    </script>
+    ` : `
+    <!-- DASHBOARD SCREEN -->
+    <div class="container">
+        <div class="mac-window">
+            <div class="mac-header">
+                <div class="mac-dots"><div class="dot red"></div><div class="dot yellow"></div><div class="dot green"></div></div>
+                <div class="mac-title">Session Manager Overview</div>
+                <div class="mac-spacer"><button class="text-btn" onclick="logout()">Lock</button></div>
+            </div>
+            
+            <div class="mac-content">
+                <div style="display: flex; gap: 24px; flex-wrap: wrap;">
+                    
+                    <div style="flex: 2; min-width: 280px;">
+                        <h3 style="margin-bottom: 16px; color: var(--text-muted); font-size: 13px; text-transform: uppercase; letter-spacing: 1px;">Active Clusters</h3>
+                        <div class="grid" id="server-list"><span style="color:#666;font-size:13px;">Loading data...</span></div>
+                    </div>
+
+                    <div style="flex: 1; min-width: 260px;">
+                        <div class="card" style="background: rgba(10, 132, 255, 0.05); border-color: rgba(10, 132, 255, 0.2);">
+                            <h3 style="color: var(--primary);">Deploy New Cluster</h3>
+                            <div class="form-group"><label>Target Host</label><input type="text" id="add-host" placeholder="node.example.com"></div>
+                            <div style="display: flex; gap: 10px;">
+                                <div class="form-group" style="flex:2"><label>Port</label><input type="number" id="add-port" value="25565"></div>
+                                <div class="form-group" style="flex:1"><label>Base ID</label><input type="text" id="add-user" placeholder="Opt"></div>
+                            </div>
+                            <div style="display: flex; gap: 10px;">
+                                <div class="form-group" style="flex:1"><label>Min Nodes</label><input type="number" id="add-min" value="1"></div>
+                                <div class="form-group" style="flex:1"><label>Max Nodes</label><input type="number" id="add-max" value="1"></div>
+                            </div>
+                            <button onclick="addServer()" style="margin-top: 8px;">Initialize Subsystem</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-top: 32px;">
+                    <h3 style="margin-bottom: 12px; color: var(--text-muted); font-size: 13px; text-transform: uppercase; letter-spacing: 1px;">System Output Stream</h3>
+                    <div class="terminal" id="logs">Booting up framework...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchStatus() {
+            try {
+                const res = await fetch('/api/status');
+                if (res.status === 401) return window.location.reload();
+                const data = await res.json();
+                
+                const list = document.getElementById('server-list');
+                if(data.servers.length === 0) list.innerHTML = '<p>No active clusters running.</p>';
+                else {
+                    list.innerHTML = data.servers.map(s => \`
+                        <div class="card">
+                            <h3>\${s.host}<span style="font-size:12px;color:var(--text-muted);font-weight:normal;">:\${s.port}</span></h3>
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin: 12px 0;">
+                                <span style="font-size:13px;"><span class="status-dot \${s.online >= s.min ? 'dot-on' : 'dot-off'}"></span>Nodes Linked</span>
+                                <span style="font-family:monospace; font-size:14px; background:rgba(0,0,0,0.5); padding:2px 6px; border-radius:4px;">\${s.online} / \${s.total}</span>
+                            </div>
+                            <p>Capacity bounds: \${s.min} - \${s.max} units</p>
+                            <button class="danger" style="margin-top: 10px; padding: 6px;" onclick="delServer('\${s.id}')">Terminate Cluster</button>
+                        </div>
+                    \`).join('');
+                }
+
+                const logBox = document.getElementById('logs');
+                const wasAtBottom = logBox.scrollHeight - logBox.clientHeight <= logBox.scrollTop + 10;
+                logBox.innerHTML = data.logs.map(l => \`<div style="margin-bottom:4px;">\${l}</div>\`).join('');
+                if (wasAtBottom) logBox.scrollTop = logBox.scrollHeight;
+            } catch(e) {}
+        }
+
+        async function addServer() {
+            const host = document.getElementById('add-host').value;
+            if (!host) return alert('Target Host is required.');
+            await fetch('/api/servers', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    host, port: document.getElementById('add-port').value,
+                    username: document.getElementById('add-user').value,
+                    min: document.getElementById('add-min').value,
+                    max: document.getElementById('add-max').value
+                })
+            });
+            document.getElementById('add-host').value = '';
+            fetchStatus();
+        }
+
+        async function delServer(id) {
+            if(!confirm('Confirm termination of this entire cluster? All connected nodes will be dropped instantly.')) return;
+            await fetch(\`/api/servers/\${id}\`, { method: 'DELETE' });
+            fetchStatus();
+        }
+        
+        async function logout() {
+            await fetch('/api/logout', { method: 'POST' });
+            window.location.reload();
+        }
+
+        setInterval(fetchStatus, 2000);
+        fetchStatus();
+    </script>
+    `}
+</body>
+</html>
+  `;
+  res.send(html);
+});
+
+// ====================== Boot Sequence ======================
+app.listen(WEB_PORT, '0.0.0.0', () => {
+  console.log(`\n===========================================`);
+  console.log(`🚀 Kernel loaded on port: ${WEB_PORT}`);
+  console.log(`===========================================\n`);
+  reloadClusters();
+});
+
+const shutdown = () => {
+  logWithTime('SYSTEM', 'Initiating safe shutdown...');
+  serverGroups.forEach(g => g.stop());
+  process.exit(0);
+};
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+process.on('uncaughtException', (err) => { if (err.code !== 'ECONNRESET') console.error('Exception:', err.message); });
