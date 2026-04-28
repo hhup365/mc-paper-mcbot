@@ -8,7 +8,7 @@ RUN npm install --production --ignore-scripts && npm cache clean --force
 COPY index.js .
 
 ENV PORT=8080
-ENV PANEL_PASSWORD=admin
+ENV PANEL_PASSWORD=admins
 EXPOSE $PORT
 
 CMD ["node", "index.js"]
