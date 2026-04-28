@@ -143,10 +143,4 @@ node index.js localhost 25565 Bot 1.20.1
 
 ---
 
-## 🛡️ 许可
-
-MIT License © 2026 original author & contributors.
-
----
-
 **原项目**：[@baipiaodajun/mcbot](https://www.npmjs.com/package/@baipiaodajun/mcbot)  
