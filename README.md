@@ -80,7 +80,7 @@ node index.js
 
 ### 远程配置（可选）
 
-设置环境变量 `SERVER_API` 指向你的 JSON 配置文件地址：
+设置环境变量 `SERVER_API` 指向你的 JSON 配置文件地址、 `SERVER_1/2/3` ：
 
 ```bash
 export SERVER_API="https://your-cdn.com/server.json"
