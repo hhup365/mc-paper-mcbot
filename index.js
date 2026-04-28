@@ -26,9 +26,7 @@ function generateUsername() {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789_';
   const length = randomBetween(6, 10);
   let name = '';
-  for (let i = 0; i < length; i++) {
-    name += chars[Math.floor(Math.random() * chars.length)];
-  }
+  for (let i = 0; i < length; i++) name += chars[Math.floor(Math.random() * chars.length)];
   if (/^\d/.test(name)) name = 'p' + name.slice(1);
   return name;
 }
@@ -44,7 +42,34 @@ function tcpPing(host, port, timeout = 2000) {
   });
 }
 
-function loadConfig() {
+// ====================== 配置加载 ======================
+function parseEnvServers() {
+  const servers = [];
+  for (let i = 1; ; i++) {
+    const raw = process.env[`SERVER_${i}`];
+    if (!raw) break;
+    const parts = raw.split(':');
+    if (parts.length < 2) continue;
+    const host = parts[0];
+    const port = parseInt(parts[1], 10) || 25565;
+    let version = false;
+    if (parts.length >= 3) {
+      const v = parts[2];
+      if (v === 'auto' || v === 'false' || v === '') version = false;
+      else version = v;
+    }
+    servers.push({
+      host,
+      port,
+      username: '',
+      version,
+      players: { min: 1, max: 1 }
+    });
+  }
+  return servers;
+}
+
+function loadConfigFile() {
   if (!fs.existsSync(CONFIG_FILE)) {
     const template = [
       {
@@ -54,13 +79,6 @@ function loadConfig() {
         version: false,
         players: { min: 1, max: 1 },
         fallbackVersions: [false, '1.20.1', '1.19.2']
-      },
-      {
-        host: 'server2.example.com',
-        port: 25566,
-        username: '',
-        version: '1.20.1',
-        players: { min: 1, max: 1 }
       }
     ];
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(template, null, 2), 'utf-8');
@@ -84,7 +102,7 @@ async function fetchRemoteConfig(url) {
   }
 }
 
-// ====================== 极简 Bot ======================
+// ====================== 极简 Bot 实例 ======================
 class BotInstance {
   constructor(serverConfig, label) {
     this.config = serverConfig;
@@ -93,15 +111,14 @@ class BotInstance {
     this.reconnecting = false;
     this.shuttingDown = false;
     this.lastActivity = Date.now();
-    this.activityTimer = null;   // 每 150~180s 一次动作
-    this.monitorTimer = null;    // 活动超时监控
+    this.activityTimer = null;
+    this.monitorTimer = null;
     this.retryCount = 0;
     this.maxRetryDelay = 300000;
     this.baseRetryDelay = 10000;
 
     this.username = this.config.username?.trim() || generateUsername();
 
-    // 版本回退
     this.fallbackVersions = Array.isArray(this.config.fallbackVersions)
       ? this.config.fallbackVersions
       : DEFAULT_FALLBACK_VERSIONS;
@@ -152,7 +169,6 @@ class BotInstance {
     logWithTime(this.label, `启动 Bot: ${this.username} (v: ${version})`);
     this.bot = mineflayer.createBot(options);
 
-    // 提前捕获底层错误
     this.bot._client.on('error', (err) => {
       logWithTime(this.label, `📡 底层错误: ${err.message}`);
     });
@@ -193,28 +209,24 @@ class BotInstance {
 
   isVersionError(err) {
     const msg = err?.message || err?.toString() || '';
-    return (
-      msg.includes('FAILED to decode packet') ||
-      msg.includes('Unsupported protocol version') ||
-      msg.includes('connection lost')
-    );
+    return msg.includes('FAILED to decode packet') ||
+           msg.includes('Unsupported protocol version') ||
+           msg.includes('connection lost');
   }
 
   updateActivity() {
     this.lastActivity = Date.now();
   }
 
-  // 每 150~180 秒随机跳跃或转向（无寻路，无攻击）
   startActivityLoop() {
     if (this.activityTimer) clearInterval(this.activityTimer);
-    const interval = randomBetween(150000, 180000); // 2.5~3 分钟
+    const interval = randomBetween(150000, 180000);
     this.activityTimer = setInterval(() => {
       if (!this.bot?.entity) return;
       this.doRandomAction();
       this.updateActivity();
     }, interval);
 
-    // 刚上线不久即执行一次，避免长时间静默
     setTimeout(() => {
       if (this.bot?.entity) {
         this.doRandomAction();
@@ -226,14 +238,11 @@ class BotInstance {
   doRandomAction() {
     const bot = this.bot;
     if (!bot?.entity) return;
-
     if (Math.random() < 0.5) {
-      // 跳跃
       bot.setControlState('jump', true);
       setTimeout(() => bot.setControlState('jump', false), 400);
       logWithTime(this.label, '↕️ 跳跃');
     } else {
-      // 随机转向
       const yaw = bot.entity.yaw + (Math.random() - 0.5) * 1.5;
       bot.look(yaw, bot.entity.pitch, true);
       logWithTime(this.label, '👀 转向');
@@ -259,7 +268,6 @@ class BotInstance {
     if (this.reconnecting || this.shuttingDown) return;
     this.reconnecting = true;
     this.cleanup();
-
     const base = Math.min(this.baseRetryDelay * Math.pow(2, this.retryCount), this.maxRetryDelay);
     const delay = Math.max(5000, base + Math.floor(Math.random() * 5000));
     this.retryCount++;
@@ -360,15 +368,25 @@ class ServerGroup {
 // ====================== 主流程 ======================
 async function main() {
   let config;
-  const apiUrl = process.env.SERVER_API || DEFAULT_SERVER_API;
-  if (apiUrl) {
-    config = await fetchRemoteConfig(apiUrl);
-    if (!config && !fs.existsSync(CONFIG_FILE)) {
-      console.error('❌ 无法获取配置，退出');
-      process.exit(1);
+
+  // 1. 优先使用环境变量 SERVER_1, SERVER_2 ...
+  const envServers = parseEnvServers();
+  if (envServers.length > 0) {
+    config = envServers;
+    console.log(`✅ 从环境变量加载 ${config.length} 个服务器`);
+  } else {
+    // 2. 尝试远程下载或本地文件
+    const apiUrl = process.env.SERVER_API || DEFAULT_SERVER_API;
+    if (apiUrl) {
+      config = await fetchRemoteConfig(apiUrl);
+      if (!config && !fs.existsSync(CONFIG_FILE)) {
+        console.error('❌ 无法获取配置，退出');
+        process.exit(1);
+      }
     }
+    if (!config) config = loadConfigFile();
   }
-  if (!config) config = loadConfig();
+
   if (!Array.isArray(config)) {
     console.error('❌ server.json 应为数组');
     process.exit(1);
