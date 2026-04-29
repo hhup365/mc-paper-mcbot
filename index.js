@@ -11,27 +11,27 @@ const CONFIG_FILE = path.join(__dirname, 'server.json');
 const WEB_PORT = process.env.PORT || process.env.SERVER_PORT || 8080;
 const PANEL_PASSWORD = process.env.PANEL_PASSWORD || 'admin';
 const AUTH_TOKEN = Math.random().toString(36).substring(2, 15);
+const DEFAULT_VERSIONS = [false, '1.20.4', '1.20.1', '1.19.2', '1.18.2'];
 
-const DEFAULT_FALLBACK_VERSIONS = [false, '1.20.4', '1.20.1', '1.19.2', '1.18.2'];
+const ADJ = ['Silent', 'Dark', 'Swift', 'Epic', 'Mystic', 'Iron', 'Ghost', 'Shadow', 'Neo', 'Frost', 'Crimson', 'Azure', 'Lunar', 'Solar', 'Void'];
+const NOUN = ['Wolf', 'Hunter', 'Ninja', 'Knight', 'Dragon', 'Sniper', 'Fox', 'Blade', 'Storm', 'Raven', 'Viper', 'Ghost', 'Hawk', 'Bear', 'Lion'];
 
 let serverGroups = new Map();
 let systemLogs = [];
 
-function logWithTime(label, msg) {
+function logWithTime(label, msg, level = 'info') {
   const now = new Date().toISOString().replace('T', ' ').split('.')[0];
-  const logStr = `[${now}] [${label}] ${msg}`;
-  console.log(logStr);
-  
-  systemLogs.push(logStr);
-  if (systemLogs.length > 200) systemLogs.shift();
+  console.log(`[${now}] [${label}] ${msg}`);
+  systemLogs.push({ t: now, l: label, m: msg, lvl: level });
+  if (systemLogs.length > 250) systemLogs.shift();
 }
 
 function generateUsername(base) {
   if (base) return base;
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  let name = 'C_';
-  for (let i = 0; i < 6; i++) name += chars[Math.floor(Math.random() * chars.length)];
-  return name;
+  const adj = ADJ[Math.floor(Math.random() * ADJ.length)];
+  const noun = NOUN[Math.floor(Math.random() * NOUN.length)];
+  const num = Math.floor(Math.random() * 9000) + 1000;
+  return `${adj}${noun}${num}`;
 }
 
 function tcpPing(host, port, timeout = 2000) {
@@ -68,22 +68,17 @@ class ClientInstance {
     this.activityTimer = null;
     this.retryCount = 0;
     this.username = generateUsername(this.config.username);
-    this.fallbackVersions = Array.isArray(this.config.fallbackVersions) ? this.config.fallbackVersions : DEFAULT_FALLBACK_VERSIONS;
     this.currentVersionIdx = 0;
   }
 
   async start(delayMs = 0) {
     if (this.shuttingDown) return;
-    
-    if (delayMs > 0) {
-        logWithTime(this.label, `Queued for connection (Waiting ${(delayMs/1000).toFixed(1)}s)...`);
-        await new Promise(r => setTimeout(r, delayMs));
-    }
+    if (delayMs > 0) await new Promise(r => setTimeout(r, delayMs));
     if (this.shuttingDown) return;
 
     const reachable = await tcpPing(this.config.host, this.config.port);
     if (!reachable) {
-      logWithTime(this.label, 'Error: Host unreachable. Retrying...');
+      logWithTime(this.label, 'Host unreachable. Retrying', 'error');
       this.scheduleReconnect(15000);
       return;
     }
@@ -92,7 +87,7 @@ class ClientInstance {
 
   createClient() {
     if (this.reconnecting || this.shuttingDown) return;
-    const version = this.fallbackVersions[this.currentVersionIdx];
+    const version = DEFAULT_VERSIONS[this.currentVersionIdx];
     
     const options = {
       host: this.config.host,
@@ -103,11 +98,11 @@ class ClientInstance {
       hideErrors: true
     };
 
-    logWithTime(this.label, `Connecting: ${this.username} (Proto: ${version || 'Auto'})`);
+    logWithTime(this.label, `Authenticating as ${this.username}`);
     this.bot = mineflayer.createBot(options);
 
     this.bot.on('login', () => {
-      logWithTime(this.label, `Connection established`);
+      logWithTime(this.label, 'Session established', 'success');
       this.reconnecting = false;
       this.retryCount = 0;
       this.startActivityLoop();
@@ -116,20 +111,19 @@ class ClientInstance {
     this.bot.on('error', (err) => {
       const msg = err.message || '';
       if (msg.includes('protocol version') || msg.includes('decode packet')) {
-        this.currentVersionIdx = (this.currentVersionIdx + 1) % this.fallbackVersions.length;
+        this.currentVersionIdx = (this.currentVersionIdx + 1) % DEFAULT_VERSIONS.length;
       }
       this.scheduleReconnect();
     });
 
     this.bot.on('end', () => {
-      if (!this.shuttingDown) logWithTime(this.label, `Connection dropped`);
+      if (!this.shuttingDown) logWithTime(this.label, 'Disconnected', 'error');
       this.scheduleReconnect();
     });
     
     this.bot.on('kicked', (reason) => {
-      const msg = String(reason);
-      logWithTime(this.label, `Terminated by host: ${msg.replace(/§[0-9a-fk-or]/ig, '').substring(0, 50)}`);
-      
+      const msg = String(reason).replace(/§[0-9a-fk-or]/ig, '');
+      logWithTime(this.label, `Kicked: ${msg.substring(0, 50)}`, 'error');
       if (msg.toLowerCase().includes('throttle') || msg.toLowerCase().includes('rate limit')) {
           this.scheduleReconnect(30000);
       } else {
@@ -139,36 +133,48 @@ class ClientInstance {
   }
 
   startActivityLoop() {
-    if (this.activityTimer) clearInterval(this.activityTimer);
+    if (this.activityTimer) clearTimeout(this.activityTimer);
     
-    this.activityTimer = setInterval(() => {
+    const doAction = () => {
       if (!this.bot?.entity || this.shuttingDown) return;
-      
-      const rand = Math.random();
-      if (rand < 0.33) {
-        this.bot.swingArm('right');
-        logWithTime(this.label, 'Activity: Sync state (0x1)');
-      } else if (rand < 0.66) {
-        this.bot.setControlState('sneak', true);
-        setTimeout(() => this.bot.setControlState('sneak', false), 500);
-        logWithTime(this.label, 'Activity: Update pose (0x2)');
-      } else {
-        const yaw = this.bot.entity.yaw + (Math.random() - 0.5);
-        this.bot.look(yaw, this.bot.entity.pitch, true);
-        logWithTime(this.label, 'Activity: Update rotation (0x3)');
-      }
-    }, 150000);
+      try {
+        const actions = ['look', 'jump', 'sneak', 'swing'];
+        const action = actions[Math.floor(Math.random() * actions.length)];
+
+        switch(action) {
+          case 'look':
+            const yaw = this.bot.entity.yaw + (Math.random() - 0.5);
+            this.bot.look(yaw, this.bot.entity.pitch, true);
+            break;
+          case 'jump':
+            this.bot.setControlState('jump', true);
+            setTimeout(() => this.bot.setControlState('jump', false), 500);
+            break;
+          case 'sneak':
+            this.bot.setControlState('sneak', true);
+            setTimeout(() => this.bot.setControlState('sneak', false), 1500);
+            break;
+          case 'swing':
+            this.bot.swingArm('right');
+            break;
+        }
+        logWithTime(this.label, `Simulated action: ${action}`, 'info');
+      } catch(e) {}
+
+      const nextTime = 180000 + Math.random() * 120000;
+      this.activityTimer = setTimeout(doAction, nextTime);
+    };
+
+    this.activityTimer = setTimeout(doAction, 30000 + Math.random() * 30000);
   }
 
   scheduleReconnect(customDelay = null) {
     if (this.reconnecting || this.shuttingDown) return;
     this.reconnecting = true;
     this.cleanup();
-    
     this.retryCount++;
     const delay = customDelay || Math.min(10000 * this.retryCount, 120000);
-    logWithTime(this.label, `Reconnecting in ${(delay/1000).toFixed(0)}s...`);
-    
+    logWithTime(this.label, `Reconnecting in ${(delay/1000).toFixed(0)}s`, 'error');
     setTimeout(() => {
       this.reconnecting = false;
       this.start();
@@ -176,7 +182,7 @@ class ClientInstance {
   }
 
   cleanup() {
-    if (this.activityTimer) clearInterval(this.activityTimer);
+    if (this.activityTimer) clearTimeout(this.activityTimer);
     if (this.bot) {
       this.bot.removeAllListeners();
       try { this.bot.quit(); } catch(e){}
@@ -196,41 +202,38 @@ class NodeGroup {
     this.config = config;
     this.label = `${config.host}:${config.port}`;
     this.instances = [];
-    this.min = Math.max(1, config.players?.min || 1);
-    this.max = Math.max(this.min, config.players?.max || 1);
-    
+    this.min = Math.max(1, parseInt(config.players?.min) || 1);
+    this.max = Math.max(this.min, parseInt(config.players?.max) || 1);
     this.targetNodes = this.min; 
     this.lastTargetUpdate = 0;
-    
     this.maintInterval = null;
     this.nextNodeId = 1;
   }
 
   start() {
-    this.updateTarget();
-    logWithTime('SYSTEM', `Cluster started [${this.label}] (Bounds: ${this.min}-${this.max})`);
+    this.updateTarget(true);
+    logWithTime('SYSTEM', `Cluster deployed: ${this.label}`, 'success');
     this.maintInterval = setInterval(() => this.maintain(), 15000);
     this.maintain();
   }
   
-  updateTarget() {
-      if (Date.now() - this.lastTargetUpdate > 300000) {
+  updateTarget(force = false) {
+      const targetUpdateInterval = 300000 + Math.random() * 300000;
+      if (force || Date.now() - this.lastTargetUpdate > targetUpdateInterval) {
           this.targetNodes = Math.floor(Math.random() * (this.max - this.min + 1)) + this.min;
           this.lastTargetUpdate = Date.now();
-          logWithTime(this.label, `Adjusted cluster target to ${this.targetNodes} nodes.`);
+          if(!force) logWithTime(this.label, `Target capacity updated to ${this.targetNodes}`, 'info');
       }
   }
 
   maintain() {
     this.updateTarget();
     const alive = this.instances.filter(b => !b.shuttingDown);
-    
     if (alive.length < this.targetNodes) {
       const node = new ClientInstance(this.config, `${this.label}-#${this.nextNodeId++}`);
       this.instances.push(node);
-      node.start(2000);
-    } 
-    else if (alive.length > this.targetNodes) {
+      node.start(Math.floor(Math.random() * 4000) + 1000);
+    } else if (alive.length > this.targetNodes) {
       const surplus = alive[alive.length - 1];
       surplus.shutdown();
       this.instances = this.instances.filter(inst => inst !== surplus);
@@ -244,11 +247,8 @@ class NodeGroup {
   }
 }
 
-function reloadClusters() {
+function initAll() {
   const configs = loadConfig();
-  for (const [id, group] of serverGroups) group.stop();
-  serverGroups.clear();
-
   configs.forEach(cfg => {
     if (!cfg.id) cfg.id = Math.random().toString(36).substr(2, 6);
     const group = new NodeGroup(cfg);
@@ -272,7 +272,7 @@ app.post('/api/login', (req, res) => {
     res.cookie('auth_token', AUTH_TOKEN, { maxAge: 86400000, httpOnly: true });
     res.json({ success: true });
   } else {
-    res.status(401).json({ error: 'Invalid password' });
+    res.status(401).json({ error: 'Denied' });
   }
 });
 
@@ -286,6 +286,7 @@ app.get('/api/status', requireAuth, (req, res) => {
     id: g.id,
     host: g.config.host,
     port: g.config.port,
+    username: g.config.username,
     min: g.min,
     max: g.max,
     target: g.targetNodes,
@@ -297,164 +298,193 @@ app.get('/api/status', requireAuth, (req, res) => {
 
 app.post('/api/servers', requireAuth, (req, res) => {
   const configs = loadConfig();
-  configs.push({
-    id: Math.random().toString(36).substr(2, 6),
-    host: req.body.host || 'localhost',
+  const reqId = req.body.id;
+  const newConfig = {
+    id: reqId || Math.random().toString(36).substr(2, 6),
+    host: req.body.host,
     port: parseInt(req.body.port) || 25565,
     username: req.body.username || '',
-    version: req.body.version === 'auto' ? false : req.body.version,
-    players: { min: parseInt(req.body.min) || 1, max: parseInt(req.body.max) || 1 }
-  });
+    players: {
+      min: parseInt(req.body.min) || 1,
+      max: Math.max(parseInt(req.body.min) || 1, parseInt(req.body.max) || 1)
+    }
+  };
+
+  const existingIdx = configs.findIndex(c => c.id === reqId);
+  if (existingIdx > -1) {
+    configs[existingIdx] = newConfig;
+    if (serverGroups.has(reqId)) {
+        serverGroups.get(reqId).stop();
+        serverGroups.delete(reqId);
+    }
+  } else {
+    configs.push(newConfig);
+  }
+  
   saveConfig(configs);
-  reloadClusters();
+  const group = new NodeGroup(newConfig);
+  serverGroups.set(newConfig.id, group);
+  group.start();
   res.json({ success: true });
 });
 
 app.delete('/api/servers/:id', requireAuth, (req, res) => {
   let configs = loadConfig();
-  configs = configs.filter(c => c.id !== req.params.id);
+  const id = req.params.id;
+  configs = configs.filter(c => c.id !== id);
   saveConfig(configs);
-  reloadClusters();
+  if (serverGroups.has(id)) {
+      serverGroups.get(id).stop();
+      serverGroups.delete(id);
+  }
   res.json({ success: true });
 });
 
 app.get('/', (req, res) => {
   const isAuthenticated = req.cookies.auth_token === AUTH_TOKEN;
-  
   const html = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Session Manager Console</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%231e293b'/><circle cx='50' cy='50' r='20' fill='%2338bdf8'/><circle cx='50' cy='50' r='10' fill='%230f172a'/></svg>">
+    <title>Session Manager</title>
     <style>
         :root {
-            --primary: #38bdf8;
-            --primary-hover: #0284c7;
-            --surface: rgba(30, 41, 59, 0.65);
-            --border: rgba(255, 255, 255, 0.08);
-            --text: #f8fafc;
-            --text-muted: #94a3b8;
-            --danger: #fb7185;
+            --bg-base: #0f172a;
+            --glass-bg: rgba(30, 41, 59, 0.4);
+            --glass-border: rgba(255, 255, 255, 0.08);
+            --glass-hover: rgba(255, 255, 255, 0.12);
+            --text-main: #f8fafc;
+            --text-sub: #94a3b8;
+            --accent: #38bdf8;
+            --accent-dim: rgba(56, 189, 248, 0.15);
+            --danger: #f87171;
+            --danger-dim: rgba(248, 113, 113, 0.1);
             --success: #34d399;
+            --warning: #fbbf24;
+            --shadow: 0 10px 40px -10px rgba(0, 0, 0, 0.5);
         }
         
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            margin: 0; padding: 40px 20px; color: var(--text);
-            min-height: 100vh;
-            background-color: #0f172a;
+            margin: 0; padding: 0; height: 100vh; overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-base);
             background-image: 
-                radial-gradient(at 10% 10%, rgba(56, 189, 248, 0.15) 0px, transparent 50%),
-                radial-gradient(at 90% 90%, rgba(139, 92, 246, 0.15) 0px, transparent 50%),
-                radial-gradient(at 50% 50%, rgba(15, 23, 42, 1) 0px, transparent 100%);
-            background-attachment: fixed;
-            -webkit-font-smoothing: antialiased;
+                radial-gradient(ellipse at 10% 10%, rgba(76, 29, 149, 0.6) 0%, transparent 70%),
+                radial-gradient(ellipse at 90% 90%, rgba(14, 116, 144, 0.6) 0%, transparent 70%),
+                radial-gradient(ellipse at 50% 50%, rgba(190, 24, 93, 0.25) 0%, transparent 70%);
+            background-size: cover; background-attachment: fixed;
+            color: var(--text-main); display: flex; flex-direction: column; -webkit-font-smoothing: antialiased;
         }
 
-        .container { max-width: 1050px; margin: 0 auto; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 10px; }
+
+        .header {
+            height: 52px; padding: 0 24px; display: flex; align-items: center;
+            background: var(--glass-bg); backdrop-filter: blur(32px); -webkit-backdrop-filter: blur(32px);
+            border-bottom: 1px solid var(--glass-border); z-index: 10; flex-shrink: 0;
+        }
+        
+        .mac-controls { display: flex; gap: 8px; margin-right: 20px; }
+        .mac-btn { width: 12px; height: 12px; border-radius: 50%; }
+        .mac-close { background: #ff5f56; }
+        .mac-min { background: #ffbd2e; }
+        .mac-max { background: #27c93f; }
+
+        .header h1 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: 0.5px; }
+        .spacer { flex: 1; }
+        .btn-text { background: transparent; border: none; color: var(--text-sub); cursor: pointer; font-size: 13px; font-weight: 500; }
+        .btn-text:hover { color: var(--text-main); }
+
+        .layout { display: flex; flex: 1; overflow: hidden; padding: 20px; gap: 20px; max-width: 1500px; margin: 0 auto; width: 100%; box-sizing: border-box; }
         
         .glass-panel {
-            background: var(--surface);
-            backdrop-filter: blur(24px);
-            -webkit-backdrop-filter: blur(24px);
-            border: 1px solid var(--border);
-            border-radius: 16px;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            overflow: hidden; margin-bottom: 24px;
+            background: var(--glass-bg); backdrop-filter: blur(32px); -webkit-backdrop-filter: blur(32px);
+            border: 1px solid var(--glass-border); border-radius: 16px; box-shadow: var(--shadow);
+            display: flex; flex-direction: column; overflow: hidden;
+        }
+
+        .panel-title {
+            padding: 14px 20px; font-size: 12px; font-weight: 600; color: var(--text-sub);
+            border-bottom: 1px solid var(--glass-border); text-transform: uppercase; letter-spacing: 1px; flex-shrink: 0;
+        }
+
+        .pane-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+        .pane-sidebar { flex: 0 0 500px; display: flex; flex-direction: column; gap: 20px; background: transparent; border: none; box-shadow: none; backdrop-filter: none; }
+        
+        .clusters-container { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        .grid-container {
+            flex: 1; overflow-y: auto; padding: 16px;
+            display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; align-content: flex-start;
         }
         
-        .panel-header {
-            background: rgba(255, 255, 255, 0.03);
-            padding: 14px 20px; display: flex; align-items: center;
-            border-bottom: 1px solid var(--border);
-        }
-        .dots { display: flex; gap: 8px; flex: 1; }
-        .dot { width: 12px; height: 12px; border-radius: 50%; }
-        .dot.red { background: #ff5f56; box-shadow: 0 0 10px rgba(255,95,86,0.4); }
-        .dot.yellow { background: #ffbd2e; box-shadow: 0 0 10px rgba(255,189,46,0.4); }
-        .dot.green { background: #27c93f; box-shadow: 0 0 10px rgba(39,201,63,0.4); }
-        .title { flex: 2; text-align: center; font-weight: 500; font-size: 14px; letter-spacing: 0.5px; color: var(--text-muted); }
-        .spacer { flex: 1; text-align: right; }
-
-        .content { padding: 24px; }
-
-        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
         .card {
-            background: rgba(255, 255, 255, 0.02);
-            border: 1px solid var(--border);
-            border-radius: 12px; padding: 18px;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            background: rgba(255,255,255,0.03); border: 1px solid var(--glass-border); border-radius: 12px;
+            padding: 14px; position: relative; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); cursor: pointer;
         }
-        .card:hover { 
-            background: rgba(255, 255, 255, 0.05); 
-            transform: translateY(-2px);
-            border-color: rgba(56, 189, 248, 0.3);
-            box-shadow: 0 10px 30px -10px rgba(0,0,0,0.5);
+        .card:hover { background: var(--glass-hover); transform: translateY(-2px); border-color: rgba(255,255,255,0.2); box-shadow: 0 8px 24px rgba(0,0,0,0.2); }
+        .card h3 { margin: 0 0 10px 0; font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 20px; }
+        
+        .card-stats { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+        .status-badge { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-sub); font-weight: 500; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; }
+        .d-on { background: var(--success); box-shadow: 0 0 8px rgba(52,211,153,0.4); }
+        .d-sync { background: var(--warning); box-shadow: 0 0 8px rgba(251,191,36,0.4); }
+        .d-off { background: var(--danger); box-shadow: 0 0 8px rgba(248,113,113,0.4); }
+        
+        .btn-del {
+            position: absolute; top: 10px; right: 10px; background: transparent; border: none;
+            color: var(--text-sub); cursor: pointer; padding: 4px; border-radius: 6px; font-size: 12px; transition: 0.2s;
         }
-        
-        h3 { margin: 0 0 14px 0; font-size: 16px; font-weight: 600; }
-        p { margin: 8px 0; font-size: 13px; color: var(--text-muted); }
-        
+        .btn-del:hover { background: var(--danger-dim); color: var(--danger); }
+
+        .form-panel { padding: 16px 20px; flex-shrink: 0; }
+        .f-row { display: flex; gap: 12px; margin-bottom: 12px; }
+        .f-col { flex: 1; }
+        label { display: block; font-size: 10px; font-weight: 600; color: var(--text-sub); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
         input {
-            width: 100%; padding: 10px 14px; margin-top: 6px;
-            background: rgba(0,0,0,0.2); border: 1px solid var(--border);
-            color: var(--text); border-radius: 8px; box-sizing: border-box;
-            font-family: inherit; font-size: 14px; outline: none; transition: border 0.2s;
+            width: 100%; padding: 8px 10px; background: rgba(0,0,0,0.2); border: 1px solid var(--glass-border);
+            border-radius: 6px; color: var(--text-main); font-size: 12px; box-sizing: border-box; outline: none; transition: 0.2s;
         }
-        input:focus { border-color: var(--primary); background: rgba(0,0,0,0.3); }
-        .form-group { margin-bottom: 14px; }
-        .form-group label { font-size: 12px; font-weight: 500; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
-
-        button {
-            background: var(--primary); color: #0f172a; border: none;
-            padding: 10px 16px; border-radius: 8px; font-weight: 600;
-            cursor: pointer; transition: all 0.2s; font-size: 14px; width: 100%;
-        }
-        button:hover { background: var(--primary-hover); color: #fff; }
-        button.danger { background: rgba(251, 113, 133, 0.1); color: var(--danger); border: 1px solid rgba(251, 113, 133, 0.2); }
-        button.danger:hover { background: var(--danger); color: white; }
-        button.text-btn { background: transparent; color: var(--text-muted); width: auto; padding: 4px 8px; font-size: 12px; }
-        button.text-btn:hover { color: var(--text); }
-
-        .terminal {
-            background: rgba(0,0,0,0.4); padding: 16px; border-radius: 12px;
-            height: 280px; overflow-y: auto; font-family: "JetBrains Mono", "Menlo", monospace;
-            font-size: 12px; color: #cbd5e1; border: 1px solid var(--border);
-            line-height: 1.6; box-shadow: inset 0 2px 10px rgba(0,0,0,0.2);
-        }
+        input:focus { border-color: var(--accent); background: rgba(0,0,0,0.3); box-shadow: 0 0 0 2px var(--accent-dim); }
         
-        .status-badge {
-            display: inline-flex; align-items: center;
-            background: rgba(0,0,0,0.3); padding: 4px 10px;
-            border-radius: 20px; font-size: 12px; font-weight: 500;
+        .btn-primary {
+            background: var(--text-main); color: #0f172a; border: none; border-radius: 6px;
+            padding: 8px 16px; font-size: 12px; font-weight: 600; cursor: pointer; transition: 0.2s;
         }
-        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-        .dot-on { background: var(--success); box-shadow: 0 0 10px var(--success); }
-        .dot-off { background: var(--danger); box-shadow: 0 0 10px var(--danger); }
-        .dot-sync { background: var(--primary); box-shadow: 0 0 10px var(--primary); animation: pulse 2s infinite; }
-        
-        @keyframes pulse {
-            0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; }
-        }
+        .btn-primary:hover { background: #e2e8f0; transform: translateY(-1px); }
+        .btn-secondary { background: transparent; color: var(--text-main); border: 1px solid var(--glass-border); }
+        .btn-secondary:hover { background: var(--glass-hover); }
 
-        .login-box { max-width: 340px; margin: 12vh auto; text-align: center; }
+        .log-stream { flex: 1; overflow-y: auto; padding: 12px 16px; font-family: "SF Mono", "Menlo", monospace; font-size: 11px; line-height: 1.5; }
+        .log-row { padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.03); display: flex; gap: 8px; }
+        .log-time { color: var(--text-sub); flex-shrink: 0; }
+        .log-label { color: #818cf8; font-weight: 600; flex-shrink: 0; width: 120px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .log-msg { flex: 1; word-break: break-all; }
+        .lvl-info { color: var(--text-main); }
+        .lvl-success { color: var(--success); }
+        .lvl-error { color: var(--danger); background: var(--danger-dim); padding: 0 4px; border-radius: 4px; font-weight: 500; }
+
+        .auth-wrap { display: flex; height: 100vh; align-items: center; justify-content: center; }
+        .auth-box { width: 280px; padding: 32px; text-align: center; }
+        .auth-icon { width: 48px; height: 48px; margin: 0 auto 20px; opacity: 0.8; }
     </style>
 </head>
 <body>
     ${!isAuthenticated ? `
-    <div class="glass-panel login-box">
-        <div class="panel-header">
-            <div class="dots"><div class="dot red"></div><div class="dot yellow"></div><div class="dot green"></div></div>
-            <div class="title">Secure Auth</div><div class="spacer"></div>
-        </div>
-        <div class="content" style="padding: 32px 24px;">
-            <svg style="width:56px; height:56px; margin-bottom:20px;" xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='rgba(255,255,255,0.05)'/><circle cx='50' cy='50' r='20' fill='#38bdf8'/><circle cx='50' cy='50' r='10' fill='#0f172a'/></svg>
-            <h2 style="margin:0 0 24px 0; font-size:18px; font-weight:500;">Core Access</h2>
-            <input type="password" id="pass" placeholder="Encryption Key" style="margin-bottom: 20px; text-align:center; letter-spacing:2px;">
-            <button onclick="login()">Authenticate</button>
+    <div class="auth-wrap">
+        <div class="glass-panel auth-box">
+            <!-- 替换为空白块为美观的锁型 SVG 图标 -->
+            <svg class="auth-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+            </svg>
+            <h2 style="margin:0 0 20px 0; font-size:16px; font-weight:600;">System Login</h2>
+            <input type="password" id="pass" placeholder="Password" style="margin-bottom:16px; text-align:center;">
+            <button class="btn-primary" style="width:100%; padding:10px;" onclick="login()">Authenticate</button>
         </div>
     </div>
     <script>
@@ -464,118 +494,143 @@ app.get('/', (req, res) => {
                 body: JSON.stringify({ password: document.getElementById('pass').value })
             });
             if(res.ok) window.location.reload();
-            else { alert('Access Denied'); document.getElementById('pass').value = ''; }
+            else document.getElementById('pass').value = '';
         }
         document.getElementById('pass').addEventListener('keypress', e => { if(e.key === 'Enter') login(); });
     </script>
     ` : `
-    <div class="container">
-        <div class="glass-panel">
-            <div class="panel-header">
-                <div class="dots"><div class="dot red"></div><div class="dot yellow"></div><div class="dot green"></div></div>
-                <div class="title">Session Manager Framework</div>
-                <div class="spacer"><button class="text-btn" onclick="logout()">Lock Session</button></div>
+    <div class="header">
+        <div class="mac-controls"><div class="mac-btn mac-close"></div><div class="mac-btn mac-min"></div><div class="mac-btn mac-max"></div></div>
+        <h1>Session Manager</h1>
+        <div class="spacer"></div>
+        <button class="btn-text" onclick="logout()">Lock Session</button>
+    </div>
+
+    <div class="layout">
+        <!-- 左侧：系统日志区 -->
+        <div class="glass-panel pane-main">
+            <div class="panel-title">System Stream</div>
+            <div class="log-stream" id="logs"></div>
+        </div>
+
+        <!-- 右侧：服务器列表与操作表单 -->
+        <div class="pane-sidebar">
+            <div class="glass-panel clusters-container">
+                <div class="panel-title">Active Clusters</div>
+                <div class="grid-container" id="server-list"></div>
             </div>
-            
-            <div class="content">
-                <div style="display: flex; gap: 24px; flex-wrap: wrap;">
-                    
-                    <!-- 左侧节点列表 -->
-                    <div style="flex: 2; min-width: 280px;">
-                        <h3 style="color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 1px;">Active Clusters</h3>
-                        <div class="grid" id="server-list"><span style="color:var(--text-muted); font-size:13px;">Establishing connection...</span></div>
-                    </div>
 
-                    <!-- 右侧部署面板 -->
-                    <div style="flex: 1; min-width: 260px;">
-                        <div class="card" style="background: rgba(56, 189, 248, 0.03); border-color: rgba(56, 189, 248, 0.2);">
-                            <h3 style="color: var(--primary);">Deploy Subsystem</h3>
-                            <div class="form-group"><label>Host Address</label><input type="text" id="add-host" placeholder="node.example.com"></div>
-                            <div style="display: flex; gap: 12px;">
-                                <div class="form-group" style="flex:2"><label>Port</label><input type="number" id="add-port" value="25565"></div>
-                                <div class="form-group" style="flex:1"><label>Base ID</label><input type="text" id="add-user" placeholder="Opt"></div>
-                            </div>
-                            <div style="display: flex; gap: 12px;">
-                                <div class="form-group" style="flex:1"><label>Min Units</label><input type="number" id="add-min" value="1"></div>
-                                <div class="form-group" style="flex:1"><label>Max Units</label><input type="number" id="add-max" value="3"></div>
-                            </div>
-                            <button onclick="addServer()" style="margin-top: 8px;">Initialize Instance</button>
-                        </div>
-                    </div>
+            <div class="glass-panel form-panel">
+                <div class="panel-title" style="padding: 0 0 12px 0; border: none;" id="f-title">Deploy Configuration</div>
+                <input type="hidden" id="edit-id">
+                <div class="f-row">
+                    <div class="f-col" style="flex:2"><label>Host Address</label><input type="text" id="cfg-host" placeholder="server.example.com"></div>
+                    <div class="f-col"><label>Port</label><input type="number" id="cfg-port" value="25565"></div>
                 </div>
-
-                <div style="margin-top: 36px;">
-                    <h3 style="color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 1px;">System Output Stream</h3>
-                    <div class="terminal" id="logs">Booting up framework...</div>
+                <div class="f-row" style="margin-bottom: 16px;">
+                    <div class="f-col" style="flex:1.5"><label>Identity Base</label><input type="text" id="cfg-user" placeholder="Auto-generated"></div>
+                    <div class="f-col"><label>Min Nodes</label><input type="number" id="cfg-min" value="1"></div>
+                    <div class="f-col"><label>Max Nodes</label><input type="number" id="cfg-max" value="3"></div>
+                </div>
+                <div style="display:flex; gap:8px;">
+                    <button class="btn-primary" id="btn-submit" onclick="submitConfig()">Initialize Deployment</button>
+                    <button class="btn-primary btn-secondary" id="btn-cancel" style="display:none;" onclick="resetForm()">Cancel</button>
                 </div>
             </div>
         </div>
     </div>
 
     <script>
+        let currentServers = [];
+        
         async function fetchStatus() {
             try {
                 const res = await fetch('/api/status');
                 if (res.status === 401) return window.location.reload();
                 const data = await res.json();
+                currentServers = data.servers;
                 
                 const list = document.getElementById('server-list');
-                if(data.servers.length === 0) list.innerHTML = '<p style="color:var(--text-muted)">No clusters deployed yet.</p>';
-                else {
-                    list.innerHTML = data.servers.map(s => {
-                        // 判断状态灯
-                        let dotClass = 'dot-off';
-                        let statusText = 'Offline';
-                        if (s.online > 0 && s.online >= s.target) { dotClass = 'dot-on'; statusText = 'Optimal'; }
-                        else if (s.online > 0) { dotClass = 'dot-sync'; statusText = 'Syncing...'; }
+                list.innerHTML = data.servers.map(s => {
+                    let dClass = 'd-off'; let txt = 'Offline';
+                    if (s.online > 0 && s.online >= s.target) { dClass = 'd-on'; txt = 'Optimal'; }
+                    else if (s.online > 0) { dClass = 'd-sync'; txt = 'Syncing'; }
 
-                        return \`
-                        <div class="card">
-                            <h3 style="margin-bottom:6px;">\${s.host}<span style="font-size:12px;color:var(--text-muted);font-weight:normal;">:\${s.port}</span></h3>
-                            
-                            <div style="display:flex; justify-content:space-between; align-items:center; margin: 16px 0;">
-                                <div class="status-badge"><span class="status-dot \${dotClass}"></span>\${statusText}</div>
-                                <div style="text-align:right;">
-                                    <span style="font-size:18px; font-weight:600; color:var(--text);">\${s.online}</span>
-                                    <span style="font-size:12px; color:var(--text-muted);">/ Target \${s.target}</span>
-                                </div>
-                            </div>
-                            
-                            <p style="font-size:12px;">Dynamic Bounds: \${s.min} ~ \${s.max} units</p>
-                            <button class="danger" style="margin-top: 12px; padding: 8px;" onclick="delServer('\${s.id}')">Terminate Cluster</button>
+                    return \`
+                    <div class="card" onclick="editServer('\${s.id}')">
+                        <button class="btn-del" onclick="event.stopPropagation(); delServer('\${s.id}')">✕</button>
+                        <h3>\${s.host}<span style="color:var(--text-sub);font-size:11px;font-weight:400;">:\${s.port}</span></h3>
+                        <div class="card-stats">
+                            <div class="status-badge"><div class="dot \${dClass}"></div>\${txt}</div>
+                            <div style="font-size:14px; font-weight:600;">\${s.online}<span style="font-size:10px; color:var(--text-sub); font-weight:400;"> / \${s.target}</span></div>
                         </div>
-                    \`}).join('');
-                }
+                        <div style="font-size:10px; color:var(--text-sub);">Bounds: \${s.min} ~ \${s.max} units</div>
+                    </div>
+                \`;}).join('');
 
                 const logBox = document.getElementById('logs');
                 const wasAtBottom = logBox.scrollHeight - logBox.clientHeight <= logBox.scrollTop + 10;
-                logBox.innerHTML = data.logs.map(l => \`<div style="margin-bottom:6px; border-bottom:1px solid rgba(255,255,255,0.05); padding-bottom:4px;">\${l}</div>\`).join('');
+                logBox.innerHTML = data.logs.map(l => \`
+                    <div class="log-row">
+                        <div class="log-time">\${l.t.split(' ')[1]}</div>
+                        <div class="log-label">\${l.l}</div>
+                        <div class="log-msg lvl-\${l.lvl}">\${l.m}</div>
+                    </div>
+                \`).join('');
                 if (wasAtBottom) logBox.scrollTop = logBox.scrollHeight;
             } catch(e) {}
         }
 
-        async function addServer() {
-            const host = document.getElementById('add-host').value;
-            if (!host) return alert('Host is required.');
+        function editServer(id) {
+            const s = currentServers.find(x => x.id === id);
+            if(!s) return;
+            document.getElementById('edit-id').value = s.id;
+            document.getElementById('cfg-host').value = s.host;
+            document.getElementById('cfg-port').value = s.port;
+            document.getElementById('cfg-user').value = s.username || '';
+            document.getElementById('cfg-min').value = s.min;
+            document.getElementById('cfg-max').value = s.max;
+            document.getElementById('f-title').innerText = 'Modify Configuration';
+            document.getElementById('btn-submit').innerText = 'Update Deployment';
+            document.getElementById('btn-cancel').style.display = 'block';
+        }
+
+        function resetForm() {
+            document.getElementById('edit-id').value = '';
+            document.getElementById('cfg-host').value = '';
+            document.getElementById('cfg-port').value = '25565';
+            document.getElementById('cfg-user').value = '';
+            document.getElementById('cfg-min').value = '1';
+            document.getElementById('cfg-max').value = '3';
+            document.getElementById('f-title').innerText = 'Deploy Configuration';
+            document.getElementById('btn-submit').innerText = 'Initialize Deployment';
+            document.getElementById('btn-cancel').style.display = 'none';
+        }
+
+        async function submitConfig() {
+            const host = document.getElementById('cfg-host').value;
+            if (!host) return;
             await fetch('/api/servers', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
-                    host, port: document.getElementById('add-port').value,
-                    username: document.getElementById('add-user').value,
-                    min: document.getElementById('add-min').value,
-                    max: document.getElementById('add-max').value
+                    id: document.getElementById('edit-id').value,
+                    host: host,
+                    port: document.getElementById('cfg-port').value,
+                    username: document.getElementById('cfg-user').value,
+                    min: document.getElementById('cfg-min').value,
+                    max: document.getElementById('cfg-max').value
                 })
             });
-            document.getElementById('add-host').value = '';
+            resetForm();
             fetchStatus();
         }
 
         async function delServer(id) {
-            if(!confirm('Confirm termination of this entire cluster?')) return;
             await fetch(\`/api/servers/\${id}\`, { method: 'DELETE' });
+            if(document.getElementById('edit-id').value === id) resetForm();
             fetchStatus();
         }
-        
+
         async function logout() {
             await fetch('/api/logout', { method: 'POST' });
             window.location.reload();
@@ -592,17 +647,13 @@ app.get('/', (req, res) => {
 });
 
 app.listen(WEB_PORT, '0.0.0.0', () => {
-  console.log(`\n===========================================`);
-  console.log(`🚀 Kernel loaded on port: ${WEB_PORT}`);
-  console.log(`===========================================\n`);
-  reloadClusters();
+  initAll();
 });
 
 const shutdown = () => {
-  logWithTime('SYSTEM', 'Initiating safe shutdown...');
   serverGroups.forEach(g => g.stop());
   process.exit(0);
 };
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
-process.on('uncaughtException', (err) => { if (err.code !== 'ECONNRESET') console.error('Exception:', err.message); });
+process.on('uncaughtException', (err) => { if (err.code !== 'ECONNRESET') {} });
