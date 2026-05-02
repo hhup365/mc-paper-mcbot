@@ -3,18 +3,23 @@
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
-const mineflayer = require('mineflayer');
 const express = require('express');
 const cookieParser = require('cookie-parser');
+
+const mineflayer = require('mineflayer');
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
+const { GoalNear } = goals;
+const { Vec3 } = require('vec3');
 
 const CONFIG_FILE = path.join(__dirname, 'server.json');
 const WEB_PORT = process.env.PORT || process.env.SERVER_PORT || 8080;
 const PANEL_PASSWORD = process.env.PANEL_PASSWORD || 'admin';
 const AUTH_TOKEN = Math.random().toString(36).substring(2, 15);
-const DEFAULT_VERSIONS = [false, '1.20.4', '1.20.1', '1.19.2', '1.18.2'];
 
-const ADJ = ['Silent', 'Dark', 'Swift', 'Epic', 'Mystic', 'Iron', 'Ghost', 'Shadow', 'Neo', 'Frost', 'Crimson', 'Azure', 'Lunar', 'Solar', 'Void'];
-const NOUN = ['Wolf', 'Hunter', 'Ninja', 'Knight', 'Dragon', 'Sniper', 'Fox', 'Blade', 'Storm', 'Raven', 'Viper', 'Ghost', 'Hawk', 'Bear', 'Lion'];
+const DEFAULT_VERSIONS = [false, '1.21', '1.20.4', '1.20.1', '1.19.4', '1.19.2', '1.18.2', '1.16.5', '1.12.2'];
+
+const ADJ = ['Silent', 'Dark', 'Swift', 'Epic', 'Mystic', 'Iron', 'Ghost', 'Shadow', 'Neo', 'Frost', 'Crimson', 'Azure', 'Lunar', 'Solar', 'Void', 'Clever', 'Brave'];
+const NOUN = ['Wolf', 'Hunter', 'Ninja', 'Knight', 'Dragon', 'Sniper', 'Fox', 'Blade', 'Storm', 'Raven', 'Viper', 'Ghost', 'Hawk', 'Bear', 'Lion', 'Panda'];
 
 let serverGroups = new Map();
 let systemLogs = [];
@@ -30,7 +35,7 @@ function generateUsername(base) {
   if (base) return base;
   const adj = ADJ[Math.floor(Math.random() * ADJ.length)];
   const noun = NOUN[Math.floor(Math.random() * NOUN.length)];
-  const num = Math.floor(Math.random() * 9000) + 1000;
+  const num = Math.random() > 0.5 ? Math.floor(Math.random() * 9000) + 1000 : '';
   return `${adj}${noun}${num}`;
 }
 
@@ -43,6 +48,22 @@ function tcpPing(host, port, timeout = 2000) {
     socket.on('timeout', () => { socket.destroy(); resolve(false); });
     socket.connect(port, host);
   });
+}
+
+function parseDisconnectReason(reason) {
+  if (!reason) return 'Unknown';
+  try {
+    let str = typeof reason === 'object' ? JSON.stringify(reason) : String(reason);
+    if (str.startsWith('{')) {
+      const obj = JSON.parse(str);
+      if (obj.text) return obj.text;
+      if (obj.translate) return obj.translate;
+      return str.substring(0, 60) + '...';
+    }
+    return str.replace(/§[0-9a-fk-or]/ig, '');
+  } catch (e) {
+    return String(reason).replace(/§[0-9a-fk-or]/ig, '').substring(0, 60);
+  }
 }
 
 function loadConfig() {
@@ -62,13 +83,19 @@ class ClientInstance {
   constructor(serverConfig, idLabel) {
     this.config = serverConfig;
     this.label = idLabel;
+    this.mode = this.config.mode || 'normal'; 
     this.bot = null;
     this.reconnecting = false;
     this.shuttingDown = false;
-    this.activityTimer = null;
     this.retryCount = 0;
     this.username = generateUsername(this.config.username);
     this.currentVersionIdx = 0;
+    this.versionMatched = false;
+    
+    this.activityTimer = null;
+    this.wanderInterval = null;
+    this.attackInterval = null;
+    this.lastAttackTime = 0;
   }
 
   async start(delayMs = 0) {
@@ -87,60 +114,89 @@ class ClientInstance {
 
   createClient() {
     if (this.reconnecting || this.shuttingDown) return;
-    const version = DEFAULT_VERSIONS[this.currentVersionIdx];
+    this.versionMatched = false; 
+    
+    const rawVersion = (this.config.version || 'auto').trim();
+    const isAuto = rawVersion.toLowerCase() === 'auto' || rawVersion === '';
+    const version = isAuto ? DEFAULT_VERSIONS[this.currentVersionIdx] : rawVersion;
     
     const options = {
       host: this.config.host,
       port: parseInt(this.config.port, 10) || 25565,
       username: this.username,
       version: version,
-      physicsEnabled: false, 
+      physicsEnabled: this.mode === 'strong', 
       hideErrors: true
     };
 
-    logWithTime(this.label, `Authenticating as ${this.username}`);
+    const verLabel = version === false ? 'Auto' : version;
+    logWithTime(this.label, `Auth [Mode: ${this.mode.toUpperCase()}] [Ver: ${verLabel}]`);
     this.bot = mineflayer.createBot(options);
 
+    if (this.mode === 'strong') {
+      this.bot.loadPlugin(pathfinder);
+    }
+
     this.bot.on('login', () => {
+      this.versionMatched = true;
       logWithTime(this.label, 'Session established', 'success');
       this.reconnecting = false;
       this.retryCount = 0;
-      this.startActivityLoop();
-    });
-
-    this.bot.on('error', (err) => {
-      const msg = err.message || '';
-      if (msg.includes('protocol version') || msg.includes('decode packet')) {
-        this.currentVersionIdx = (this.currentVersionIdx + 1) % DEFAULT_VERSIONS.length;
+      
+      if (this.mode === 'normal') {
+          this.startNormalBehavior();
       }
-      this.scheduleReconnect();
     });
 
-    this.bot.on('end', () => {
-      if (!this.shuttingDown) logWithTime(this.label, 'Disconnected', 'error');
-      this.scheduleReconnect();
+    this.bot.on('spawn', () => {
+      if (this.mode === 'strong' && !this.wanderInterval) {
+          logWithTime(this.label, 'Spawned. Starting Strong Keep-Alive', 'success');
+          this.startStrongBehavior();
+      }
     });
-    
-    this.bot.on('kicked', (reason) => {
-      const msg = String(reason).replace(/§[0-9a-fk-or]/ig, '');
-      logWithTime(this.label, `Kicked: ${msg.substring(0, 50)}`, 'error');
-      if (msg.toLowerCase().includes('throttle') || msg.toLowerCase().includes('rate limit')) {
-          this.scheduleReconnect(30000);
+
+    const handleDisconnect = (reason, isKick = false) => {
+      if (this.shuttingDown) return;
+      const msg = parseDisconnectReason(reason);
+
+      if (!this.versionMatched) {
+        if (isAuto) {
+          this.currentVersionIdx = (this.currentVersionIdx + 1) % DEFAULT_VERSIONS.length;
+          logWithTime(this.label, `Handshake/Ver error, trying next...`, 'warning');
+        } else {
+          logWithTime(this.label, `Custom Version [${rawVersion}] might be wrong! Kick: ${msg}`, 'error');
+        }
+      } else if (isKick) {
+        logWithTime(this.label, `Kicked: ${msg}`, 'error');
       } else {
+        logWithTime(this.label, 'Disconnected', 'error');
+      }
+      
+      this.scheduleReconnect(msg.toLowerCase().includes('throttle') ? 30000 : null);
+    };
+
+    this.bot.on('error', (err) => handleDisconnect(err.message));
+    this.bot.on('end', (reason) => handleDisconnect(reason));
+    this.bot.on('kicked', (reason) => handleDisconnect(reason, true));
+
+    this.bot._client?.on('packet', (data, meta) => {
+      if (meta.name === 'explosion') {
+        const y = data.playerKnockback?.y;
+        if (typeof y === 'number' && (y > 1e12 || isNaN(y))) {
+          logWithTime(this.label, 'Explosion packet anomaly detected', 'warning');
           this.scheduleReconnect();
+        }
       }
     });
   }
 
-  startActivityLoop() {
+  startNormalBehavior() {
     if (this.activityTimer) clearTimeout(this.activityTimer);
-    
     const doAction = () => {
       if (!this.bot?.entity || this.shuttingDown) return;
       try {
         const actions = ['look', 'jump', 'sneak', 'swing'];
         const action = actions[Math.floor(Math.random() * actions.length)];
-
         switch(action) {
           case 'look':
             const yaw = this.bot.entity.yaw + (Math.random() - 0.5);
@@ -158,14 +214,66 @@ class ClientInstance {
             this.bot.swingArm('right');
             break;
         }
-        logWithTime(this.label, `Simulated action: ${action}`, 'info');
+        logWithTime(this.label, `Action: ${action}`, 'info');
       } catch(e) {}
-
+      
       const nextTime = 180000 + Math.random() * 120000;
       this.activityTimer = setTimeout(doAction, nextTime);
     };
-
     this.activityTimer = setTimeout(doAction, 30000 + Math.random() * 30000);
+  }
+
+  startStrongBehavior() {
+    if (!this.bot?.pathfinder || !this.bot.version) return;
+    
+    const defaultMove = new Movements(this.bot, require('minecraft-data')(this.bot.version));
+    this.bot.pathfinder.setMovements(defaultMove);
+
+    const wander = () => {
+      if (!this.bot?.entity || this.shuttingDown) return;
+      if (this.bot.pathfinder.isMoving()) return; 
+
+      const dx = Math.floor(Math.random() * 20 - 10);
+      const dz = Math.floor(Math.random() * 20 - 10);
+      
+      const targetX = this.bot.entity.position.x + dx;
+      const targetZ = this.bot.entity.position.z + dz;
+      const targetY = this.bot.entity.position.y;
+      
+      const targetPos = new Vec3(targetX, targetY, targetZ);
+      
+      if (this.bot.entity.position.distanceTo(targetPos) > 1) {
+          const goal = new GoalNear(targetX, targetY, targetZ, 1);
+          this.bot.pathfinder.setGoal(goal);
+          logWithTime(this.label, 'Wandering...', 'info');
+      }
+    };
+    
+    const attack = () => {
+      if (!this.bot?.entity || this.shuttingDown) return;
+      const now = Date.now();
+      if (now - this.lastAttackTime < 5000) return; 
+
+      const entity = Object.values(this.bot.entities).find(e =>
+        e.type === 'mob' &&
+        e.position.distanceTo(this.bot.entity.position) < 6 &&
+        e.mobType !== 'Armor Stand'
+      );
+      
+      if (entity) {
+        this.bot.lookAt(entity.position.offset(0, entity.height, 0), true, () => {
+          this.bot.attack(entity);
+          logWithTime(this.label, `Attacked ${entity.name}`, 'warning');
+          this.lastAttackTime = now;
+        });
+      }
+    };
+
+    if (this.wanderInterval) clearInterval(this.wanderInterval);
+    if (this.attackInterval) clearInterval(this.attackInterval);
+
+    this.wanderInterval = setInterval(wander, 30000);
+    this.attackInterval = setInterval(attack, 1000);
   }
 
   scheduleReconnect(customDelay = null) {
@@ -183,6 +291,8 @@ class ClientInstance {
 
   cleanup() {
     if (this.activityTimer) clearTimeout(this.activityTimer);
+    if (this.wanderInterval) clearInterval(this.wanderInterval);
+    if (this.attackInterval) clearInterval(this.attackInterval);
     if (this.bot) {
       this.bot.removeAllListeners();
       try { this.bot.quit(); } catch(e){}
@@ -212,7 +322,7 @@ class NodeGroup {
 
   start() {
     this.updateTarget(true);
-    logWithTime('SYSTEM', `Cluster deployed: ${this.label}`, 'success');
+    logWithTime('SYSTEM', `Cluster deployed: ${this.label} [${this.config.mode || 'normal'}]`, 'success');
     this.maintInterval = setInterval(() => this.maintain(), 15000);
     this.maintain();
   }
@@ -287,6 +397,8 @@ app.get('/api/status', requireAuth, (req, res) => {
     host: g.config.host,
     port: g.config.port,
     username: g.config.username,
+    version: g.config.version || 'auto',
+    mode: g.config.mode || 'normal',
     min: g.min,
     max: g.max,
     target: g.targetNodes,
@@ -304,6 +416,8 @@ app.post('/api/servers', requireAuth, (req, res) => {
     host: req.body.host,
     port: parseInt(req.body.port) || 25565,
     username: req.body.username || '',
+    version: req.body.version || 'auto',
+    mode: req.body.mode || 'normal',
     players: {
       min: parseInt(req.body.min) || 1,
       max: Math.max(parseInt(req.body.min) || 1, parseInt(req.body.max) || 1)
@@ -348,7 +462,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Session Manager</title>
+    <title>Session Manager Pro</title>
     <style>
         :root {
             --bg-base: #0f172a;
@@ -445,11 +559,12 @@ app.get('/', (req, res) => {
         .f-row { display: flex; gap: 12px; margin-bottom: 12px; }
         .f-col { flex: 1; }
         label { display: block; font-size: 10px; font-weight: 600; color: var(--text-sub); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
-        input {
+        input, select {
             width: 100%; padding: 8px 10px; background: rgba(0,0,0,0.2); border: 1px solid var(--glass-border);
             border-radius: 6px; color: var(--text-main); font-size: 12px; box-sizing: border-box; outline: none; transition: 0.2s;
         }
-        input:focus { border-color: var(--accent); background: rgba(0,0,0,0.3); box-shadow: 0 0 0 2px var(--accent-dim); }
+        select option { background: var(--bg-base); color: var(--text-main); }
+        input:focus, select:focus { border-color: var(--accent); background: rgba(0,0,0,0.3); box-shadow: 0 0 0 2px var(--accent-dim); }
         
         .btn-primary {
             background: var(--text-main); color: #0f172a; border: none; border-radius: 6px;
@@ -467,6 +582,7 @@ app.get('/', (req, res) => {
         .lvl-info { color: var(--text-main); }
         .lvl-success { color: var(--success); }
         .lvl-error { color: var(--danger); background: var(--danger-dim); padding: 0 4px; border-radius: 4px; font-weight: 500; }
+        .lvl-warning { color: var(--warning); }
 
         .auth-wrap { display: flex; height: 100vh; align-items: center; justify-content: center; }
         .auth-box { width: 280px; padding: 32px; text-align: center; }
@@ -477,7 +593,6 @@ app.get('/', (req, res) => {
     ${!isAuthenticated ? `
     <div class="auth-wrap">
         <div class="glass-panel auth-box">
-            <!-- 替换为空白块为美观的锁型 SVG 图标 -->
             <svg class="auth-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
                 <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
@@ -501,19 +616,17 @@ app.get('/', (req, res) => {
     ` : `
     <div class="header">
         <div class="mac-controls"><div class="mac-btn mac-close"></div><div class="mac-btn mac-min"></div><div class="mac-btn mac-max"></div></div>
-        <h1>Session Manager</h1>
+        <h1>Session Manager Pro</h1>
         <div class="spacer"></div>
         <button class="btn-text" onclick="logout()">Lock Session</button>
     </div>
 
     <div class="layout">
-        <!-- 左侧：系统日志区 -->
         <div class="glass-panel pane-main">
             <div class="panel-title">System Stream</div>
             <div class="log-stream" id="logs"></div>
         </div>
 
-        <!-- 右侧：服务器列表与操作表单 -->
         <div class="pane-sidebar">
             <div class="glass-panel clusters-container">
                 <div class="panel-title">Active Clusters</div>
@@ -523,15 +636,43 @@ app.get('/', (req, res) => {
             <div class="glass-panel form-panel">
                 <div class="panel-title" style="padding: 0 0 12px 0; border: none;" id="f-title">Deploy Configuration</div>
                 <input type="hidden" id="edit-id">
+                
                 <div class="f-row">
                     <div class="f-col" style="flex:2"><label>Host Address</label><input type="text" id="cfg-host" placeholder="server.example.com"></div>
                     <div class="f-col"><label>Port</label><input type="number" id="cfg-port" value="25565"></div>
                 </div>
-                <div class="f-row" style="margin-bottom: 16px;">
+                
+                <div class="f-row">
                     <div class="f-col" style="flex:1.5"><label>Identity Base</label><input type="text" id="cfg-user" placeholder="Auto-generated"></div>
+                    <div class="f-col">
+                        <label>Version</label>
+                        <input type="text" id="cfg-version" list="version-list" placeholder="Auto / e.g. 1.8.9" value="auto">
+                        <datalist id="version-list">
+                            <option value="auto">
+                            <option value="1.21">
+                            <option value="1.20.4">
+                            <option value="1.20.1">
+                            <option value="1.19.4">
+                            <option value="1.19.2">
+                            <option value="1.18.2">
+                            <option value="1.16.5">
+                            <option value="1.12.2">
+                        </datalist>
+                    </div>
+                    <div class="f-col">
+                        <label>Mode</label>
+                        <select id="cfg-mode">
+                            <option value="normal">Normal</option>
+                            <option value="strong">Strong</option>
+                        </select>
+                    </div>
+                </div>
+                
+                <div class="f-row" style="margin-bottom: 16px;">
                     <div class="f-col"><label>Min Nodes</label><input type="number" id="cfg-min" value="1"></div>
                     <div class="f-col"><label>Max Nodes</label><input type="number" id="cfg-max" value="3"></div>
                 </div>
+                
                 <div style="display:flex; gap:8px;">
                     <button class="btn-primary" id="btn-submit" onclick="submitConfig()">Initialize Deployment</button>
                     <button class="btn-primary btn-secondary" id="btn-cancel" style="display:none;" onclick="resetForm()">Cancel</button>
@@ -555,6 +696,9 @@ app.get('/', (req, res) => {
                     let dClass = 'd-off'; let txt = 'Offline';
                     if (s.online > 0 && s.online >= s.target) { dClass = 'd-on'; txt = 'Optimal'; }
                     else if (s.online > 0) { dClass = 'd-sync'; txt = 'Syncing'; }
+                    
+                    const modeIcon = s.mode === 'strong' ? '⚔️' : '🛡️';
+                    const verText = (!s.version || s.version.toLowerCase() === 'auto') ? 'Auto' : s.version;
 
                     return \`
                     <div class="card" onclick="editServer('\${s.id}')">
@@ -564,7 +708,11 @@ app.get('/', (req, res) => {
                             <div class="status-badge"><div class="dot \${dClass}"></div>\${txt}</div>
                             <div style="font-size:14px; font-weight:600;">\${s.online}<span style="font-size:10px; color:var(--text-sub); font-weight:400;"> / \${s.target}</span></div>
                         </div>
-                        <div style="font-size:10px; color:var(--text-sub);">Bounds: \${s.min} ~ \${s.max} units</div>
+                        <div style="display:flex; justify-content:space-between; font-size:10px; color:var(--text-sub); margin-top:4px;">
+                            <span>Ver: \${verText}</span>
+                            <span>\${s.min}~\${s.max}u</span>
+                            <span>\${modeIcon} \${s.mode.charAt(0).toUpperCase() + s.mode.slice(1)}</span>
+                        </div>
                     </div>
                 \`;}).join('');
 
@@ -588,6 +736,8 @@ app.get('/', (req, res) => {
             document.getElementById('cfg-host').value = s.host;
             document.getElementById('cfg-port').value = s.port;
             document.getElementById('cfg-user').value = s.username || '';
+            document.getElementById('cfg-version').value = s.version || 'auto';
+            document.getElementById('cfg-mode').value = s.mode || 'normal';
             document.getElementById('cfg-min').value = s.min;
             document.getElementById('cfg-max').value = s.max;
             document.getElementById('f-title').innerText = 'Modify Configuration';
@@ -600,6 +750,8 @@ app.get('/', (req, res) => {
             document.getElementById('cfg-host').value = '';
             document.getElementById('cfg-port').value = '25565';
             document.getElementById('cfg-user').value = '';
+            document.getElementById('cfg-version').value = 'auto';
+            document.getElementById('cfg-mode').value = 'normal';
             document.getElementById('cfg-min').value = '1';
             document.getElementById('cfg-max').value = '3';
             document.getElementById('f-title').innerText = 'Deploy Configuration';
@@ -617,6 +769,8 @@ app.get('/', (req, res) => {
                     host: host,
                     port: document.getElementById('cfg-port').value,
                     username: document.getElementById('cfg-user').value,
+                    version: document.getElementById('cfg-version').value,
+                    mode: document.getElementById('cfg-mode').value,
                     min: document.getElementById('cfg-min').value,
                     max: document.getElementById('cfg-max').value
                 })
