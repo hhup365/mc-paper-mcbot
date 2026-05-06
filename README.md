@@ -1,25 +1,24 @@
 # Minecraft AFK Bot (Multi-Server)
 
-> 🧟 低资源占用的 Minecraft 挂机机器人，支持多服务器、动态人数、远程配置同步及智能版本回退。  
-> Forked from [@baipiaodajun/mcbot](https://www.npmjs.com/package/@baipiaodajun/mcbot)
+> 🧟 A lightweight Minecraft AFK bot with multi-server support, dynamic player simulation, remote config sync, and smart version fallback.
 
 [![npm version](https://img.shields.io/npm/v/@baipiaodajun/mcbot)](https://www.npmjs.com/package/@baipiaodajun/mcbot)
 [![license](https://img.shields.io/npm/l/@baipiaodajun/mcbot)](LICENSE)
 
 ---
 
-## ✨ 特性
+## ✨ Features
 
-- **多服务器并行** – 一个配置文件管理无限数量的 Minecraft 服务器。
-- **动态人数池** – 为每个服务器设置最小/最大在线人数，自动模拟玩家上下线。
-- **远程配置同步** – 通过 `SERVER_API` 环境变量拉取远程 `server.json`，重启即更新所有挂机配置。
-- **智能版本回退** – 遇到协议解码错误时自动尝试备选版本列表（1.20.4 → 1.20.1 → 1.19.2 …），告别手动换版本。
-- **字母数字混合用户名** – 自动生成类似 `x4k_9ab` 的随机 ID，亦可指定固定名称。
-- **断线指数退避重连** – 网络抖动时自动恢复，避免服务器压力。
+* **Multi-server support** – Manage unlimited Minecraft servers with a single config file.
+* **Dynamic player pool** – Set min/max players per server and simulate joins/leaves automatically.
+* **Remote config sync** – Fetch `server.json` via `SERVER_API` on startup.
+* **Smart version fallback** – Automatically retries compatible versions (1.20.4 → 1.20.1 → 1.19.2 …).
+* **Randomized usernames** – Generates names like `x4k_9ab`, or use custom ones.
+* **Exponential reconnect** – Handles disconnects gracefully without spamming servers.
 
 ---
 
-## 📦 安装
+## 📦 Installation
 
 ```bash
 git clone https://github.com/yourusername/mc-afk-bot.git
@@ -27,16 +26,9 @@ cd mc-afk-bot
 npm install
 ```
 
-**唯一依赖**：  
-- [`mineflayer`](https://github.com/PrismarineJS/mineflayer) ^4.0.0
+## ⚙️ Configuration
 
-（无需 `mineflayer-pathfinder` 或 `vec3`，真正零额外计算负载）
-
----
-
-## ⚙️ 配置
-
-首次运行会在当前目录自动生成 `server.json` 模板，按需编辑即可。
+On first run, a `server.json` file will be generated.
 
 ```json
 [
@@ -58,43 +50,84 @@ npm install
 ]
 ```
 
-### 字段说明
+### Field Explanation
 
-| 字段              | 类型     | 必填 | 说明                                                                 |
-| ----------------- | -------- | ---- | -------------------------------------------------------------------- |
-| `host`            | string   | 是   | 服务器地址                                                           |
-| `port`            | number   | 是   | 服务器端口（默认 25565）                                             |
-| `username`        | string   | 否   | 机器人用户名，留空则随机生成字母数字组合                               |
-| `version`         | string / false | 否 | 指定 MC 版本，如 `"1.20.1"`，设为 `false` 自动检测                   |
-| `players`         | object   | 否   | 同时在线人数区间 `{ "min": 1, "max": 1 }`，默认单人                 |
-| `fallbackVersions`| array    | 否   | 版本回退列表，默认 `[false, "1.20.4", "1.20.1", "1.19.2", "1.18.2"]` |
+| Field              | Type           | Required | Description                      |
+| ------------------ | -------------- | -------- | -------------------------------- |
+| `host`             | string         | Yes      | Server address                   |
+| `port`             | number         | Yes      | Server port (default 25565)      |
+| `username`         | string         | No       | Bot name (random if empty)       |
+| `version`          | string / false | No       | Minecraft version or auto-detect |
+| `players`          | object         | No       | `{ min, max }` player range      |
+| `fallbackVersions` | array          | No       | Version fallback list            |
 
 ---
 
-## 🚀 使用
+## ☁️ Remote Config (JSONBin Support)
 
-### 基本启动
+In addition to `SERVER_API`, you can use **JSONBin** for centralized config storage.
+
+### 🔑 Environment Variables
+
+```bash
+JSONBIN_KEY=your_api_key
+JSONBIN_ID=your_bin_id
+```
+
+### How to get them:
+
+1. Go to [JSONBin.io](https://jsonbin.io) and create an account
+2. Copy your **API Key** from *API Keys → Master Key*
+3. Create a new Bin
+4. Copy the Bin ID (e.g. `65f1a2b3c...`)
+
+---
+
+### 📥 Behavior
+
+On startup:
+
+1. Fetch config from JSONBin
+2. Overwrite local `server.json`
+3. Start bots using latest config
+
+Perfect for multi-instance deployments.
+
+---
+
+### ⚠️ Notes
+
+* Keep your API key private
+* Free tier has rate limits
+* Ideal for Docker / distributed setups
+
+---
+
+## 🚀 Usage
+
+### Basic
+
 ```bash
 node index.js
 ```
 
-### 远程配置（可选）
-
-设置环境变量 `SERVER_API` 指向你的 JSON 配置文件地址：
+### Remote config
 
 ```bash
 export SERVER_API="https://your-cdn.com/server.json"
 node index.js
 ```
-设置环境变量 `SERVER_1`来快速配置地址：
+
+### Quick env setup
 
 ```bash
 SERVER_1=host:port[:version]
 ```
 
-启动时会先下载远程 `server.json` 覆盖本地，然后加载。之后每次重启容器或进程都会拉取最新配置，实现集中管理。
+---
 
-### Docker 示例
+## 🐳 Docker
+
 ```dockerfile
 FROM node:18-alpine
 WORKDIR /app
@@ -104,48 +137,52 @@ COPY index.js .
 CMD ["node", "index.js"]
 ```
 
-运行时传入环境变量：
+Run:
+
 ```bash
 docker run -e SERVER_API=https://... -d mc-afk-bot
 ```
 
 ---
 
-## 📊 性能
+## 📊 Performance
 
-测试环境：Node 18，单核 VPS。  
-挂机 1 个服务器（3 个 Bot）：
-- **CPU**：< 1%
-- **内存**：~40 MB（所有 Bot 合计）
+Tested on Node 18, single-core VPS:
 
-无寻路计算、无实体扫描，定时器间隔 ≥ 150 秒，长期运行零负担。
+* **CPU**: < 1%
+* **Memory**: ~40 MB (3 bots total)
 
----
-
-## 🔄 行为描述
-
-- 登录后每个 Bot 每 **150~180 秒**随机执行一次动作（跳跃或转向），确保 3 分钟内有活动。
-- 人数池维护：每 60 秒检查在线人数，自动补足或移除多余 Bot。
-- 换人机制：若配置 `players.max > min`，每隔 **10~20 分钟**随机踢掉一个 Bot，并在 20~60 秒后以新名字加入，模拟真实玩家切换。
-- 异常处理：连接超时、解码错误、被踢等均会自动触发重连，版本不匹配时自动降级。
+No pathfinding, no entity scanning.
 
 ---
 
-## 🧰 命令行参数 (兼容旧版)
+## 🔄 Behavior
 
-尽管推荐使用 `server.json` 配置，仍支持命令行快速单服启动（用于测试）：
+* Every **150–180 seconds**: random action (jump/look)
+* Every **60 seconds**: adjust player count
+* Every **10–20 minutes**: rotate bots (simulate real players)
+* Auto-reconnect + version downgrade on errors
+
+---
+
+## 🧰 CLI (Legacy)
 
 ```bash
 node index.js <host> <port> <username> <version>
 ```
 
-例如：
+Example:
+
 ```bash
 node index.js localhost 25565 Bot 1.20.1
 ```
 
-环境变量 `HOST`, `PORT`, `USERNAME`, `MCVERSION` 也可用，优先级低于命令行参数。
+Env vars also supported:
+`HOST`, `PORT`, `USERNAME`, `MCVERSION`
 
 ---
 
-**原项目**：[@baipiaodajun/mcbot](https://www.npmjs.com/package/@baipiaodajun/mcbot)  
+## 📌 Credits
+
+Original project:
+[@baipiaodajun/mcbot](https://www.npmjs.com/package/@baipiaodajun/mcbot)
