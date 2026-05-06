@@ -15,14 +15,17 @@ const CONFIG_FILE = path.join(__dirname, 'server.json');
 const WEB_PORT = process.env.PORT || process.env.SERVER_PORT || 8080;
 const PANEL_PASSWORD = process.env.PANEL_PASSWORD || 'admin';
 const AUTH_TOKEN = Math.random().toString(36).substring(2, 15);
+const JSONBIN_ID = process.env.JSONBIN_ID;
+const JSONBIN_KEY = process.env.JSONBIN_KEY;
 
-const DEFAULT_VERSIONS = [false, '1.21', '1.20.4', '1.20.1', '1.19.4', '1.19.2', '1.18.2', '1.16.5', '1.12.2'];
+const DEFAULT_VERSIONS = [false, '1.21', '1.21.8', '1.20.4', '1.20.1', '1.19.4', '1.19.2', '1.18.2', '1.16.5', '1.12.2'];
 
 const ADJ = ['Silent', 'Dark', 'Swift', 'Epic', 'Mystic', 'Iron', 'Ghost', 'Shadow', 'Neo', 'Frost', 'Crimson', 'Azure', 'Lunar', 'Solar', 'Void', 'Clever', 'Brave'];
 const NOUN = ['Wolf', 'Hunter', 'Ninja', 'Knight', 'Dragon', 'Sniper', 'Fox', 'Blade', 'Storm', 'Raven', 'Viper', 'Ghost', 'Hawk', 'Bear', 'Lion', 'Panda'];
 
 let serverGroups = new Map();
 let systemLogs = [];
+let cachedConfig = [];
 
 function logWithTime(label, msg, level = 'info') {
   const now = new Date().toISOString().replace('T', ' ').split('.')[0];
@@ -66,17 +69,56 @@ function parseDisconnectReason(reason) {
   }
 }
 
-function loadConfig() {
-  if (!fs.existsSync(CONFIG_FILE)) {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify([], null, 2), 'utf-8');
-    return [];
+async function loadConfig() {
+  const useCloud = JSONBIN_ID && JSONBIN_KEY;
+  if (useCloud) {
+    try {
+      const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_ID}/latest`, {
+        headers: { 'X-Master-Key': JSONBIN_KEY }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        cachedConfig = data.record || [];
+        return cachedConfig;
+      }
+    } catch (e) {
+      logWithTime('SYSTEM', 'Failed to load config from JSONBin.io', 'error');
+    }
+    return cachedConfig;
+  } else {
+    if (!fs.existsSync(CONFIG_FILE)) {
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify([], null, 2), 'utf-8');
+      cachedConfig = [];
+      return cachedConfig;
+    }
+    try { 
+      cachedConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')); 
+      return cachedConfig;
+    } catch (e) { 
+      return []; 
+    }
   }
-  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')); } 
-  catch (e) { return []; }
 }
 
-function saveConfig(config) {
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+async function saveConfig(config) {
+  cachedConfig = config;
+  const useCloud = JSONBIN_ID && JSONBIN_KEY;
+  if (useCloud) {
+    try {
+      await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_ID}`, {
+        method: 'PUT',
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-Master-Key': JSONBIN_KEY 
+        },
+        body: JSON.stringify(config)
+      });
+    } catch (e) {
+      logWithTime('SYSTEM', 'Failed to save config to JSONBin.io', 'error');
+    }
+  } else {
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+  }
 }
 
 class ClientInstance {
@@ -357,15 +399,15 @@ class NodeGroup {
   }
 }
 
-function initAll() {
-  const configs = loadConfig();
+async function initAll() {
+  const configs = await loadConfig();
   configs.forEach(cfg => {
     if (!cfg.id) cfg.id = Math.random().toString(36).substr(2, 6);
     const group = new NodeGroup(cfg);
     serverGroups.set(cfg.id, group);
     group.start();
   });
-  saveConfig(configs);
+  await saveConfig(configs);
 }
 
 const app = express();
@@ -408,8 +450,8 @@ app.get('/api/status', requireAuth, (req, res) => {
   res.json({ servers: status, logs: systemLogs });
 });
 
-app.post('/api/servers', requireAuth, (req, res) => {
-  const configs = loadConfig();
+app.post('/api/servers', requireAuth, async (req, res) => {
+  const configs = await loadConfig();
   const reqId = req.body.id;
   const newConfig = {
     id: reqId || Math.random().toString(36).substr(2, 6),
@@ -435,18 +477,18 @@ app.post('/api/servers', requireAuth, (req, res) => {
     configs.push(newConfig);
   }
   
-  saveConfig(configs);
+  await saveConfig(configs);
   const group = new NodeGroup(newConfig);
   serverGroups.set(newConfig.id, group);
   group.start();
   res.json({ success: true });
 });
 
-app.delete('/api/servers/:id', requireAuth, (req, res) => {
-  let configs = loadConfig();
+app.delete('/api/servers/:id', requireAuth, async (req, res) => {
+  let configs = await loadConfig();
   const id = req.params.id;
   configs = configs.filter(c => c.id !== id);
-  saveConfig(configs);
+  await saveConfig(configs);
   if (serverGroups.has(id)) {
       serverGroups.get(id).stop();
       serverGroups.delete(id);
@@ -801,7 +843,9 @@ app.get('/', (req, res) => {
 });
 
 app.listen(WEB_PORT, '0.0.0.0', () => {
-  initAll();
+  initAll().catch(err => {
+    logWithTime('SYSTEM', 'Failed to initialize clusters: ' + err.message, 'error');
+  });
 });
 
 const shutdown = () => {
