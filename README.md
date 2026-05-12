@@ -68,14 +68,13 @@ On first run, a `server.json` file will be generated.
 ### 🔑 Environment Variables
 
 ```bash
-CONFIG_SECRET=your_api_key
+CONFIG_SECRET=admin
 CONFIG_URL=your_bin_url
 ```
 
 ### ⚠️ Notes
 
 * Keep your API key private
-* Free tier has rate limits
 * Ideal for Docker / distributed setups
 
 ---
