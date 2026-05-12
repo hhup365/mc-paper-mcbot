@@ -63,37 +63,14 @@ On first run, a `server.json` file will be generated.
 
 ---
 
-## ☁️ Remote Config (JSONBin Support)
-
-In addition to `SERVER_API`, you can use **JSONBin** for centralized config storage.
+## ☁️ Remote Config
 
 ### 🔑 Environment Variables
 
 ```bash
-JSONBIN_KEY=your_api_key
-JSONBIN_ID=your_bin_id
+CONFIG_SECRET=your_api_key
+CONFIG_URL=your_bin_url
 ```
-
-### How to get them:
-
-1. Go to [JSONBin.io](https://jsonbin.io) and create an account
-2. Copy your **API Key** from *API Keys → Master Key*
-3. Create a new Bin
-4. Copy the Bin ID (e.g. `65f1a2b3c...`)
-
----
-
-### 📥 Behavior
-
-On startup:
-
-1. Fetch config from JSONBin
-2. Overwrite local `server.json`
-3. Start bots using latest config
-
-Perfect for multi-instance deployments.
-
----
 
 ### ⚠️ Notes
 
