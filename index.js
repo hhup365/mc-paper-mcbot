@@ -15,10 +15,11 @@ const CONFIG_FILE = path.join(__dirname, 'server.json');
 const WEB_PORT = process.env.PORT || process.env.SERVER_PORT || 8080;
 const PANEL_PASSWORD = process.env.PANEL_PASSWORD || 'admin';
 const AUTH_TOKEN = Math.random().toString(36).substring(2, 15);
-const JSONBIN_ID = process.env.JSONBIN_ID;
-const JSONBIN_KEY = process.env.JSONBIN_KEY;
 
-const DEFAULT_VERSIONS = [false, '1.21', '1.21.8', '1.20.4', '1.20.1', '1.19.4', '1.19.2', '1.18.2', '1.16.5', '1.12.2'];
+const CONFIG_URL = process.env.CONFIG_URL;
+const CONFIG_SECRET = process.env.CONFIG_SECRET || 'your_secret_token';
+
+const DEFAULT_VERSIONS = [false, '1.21','1.21.11', '1.21.8', '1.20.4', '1.20.1', '1.19.4', '1.19.2', '1.18.2', '1.16.5', '1.12.2'];
 
 const ADJ = ['Silent', 'Dark', 'Swift', 'Epic', 'Mystic', 'Iron', 'Ghost', 'Shadow', 'Neo', 'Frost', 'Crimson', 'Azure', 'Lunar', 'Solar', 'Void', 'Clever', 'Brave'];
 const NOUN = ['Wolf', 'Hunter', 'Ninja', 'Knight', 'Dragon', 'Sniper', 'Fox', 'Blade', 'Storm', 'Raven', 'Viper', 'Ghost', 'Hawk', 'Bear', 'Lion', 'Panda'];
@@ -70,54 +71,62 @@ function parseDisconnectReason(reason) {
 }
 
 async function loadConfig() {
-  const useCloud = JSONBIN_ID && JSONBIN_KEY;
-  if (useCloud) {
+  if (CONFIG_URL) {
     try {
-      const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_ID}/latest`, {
-        headers: { 'X-Master-Key': JSONBIN_KEY }
+      const res = await fetch(CONFIG_URL, {
+        headers: { 'X-Secret': CONFIG_SECRET }
       });
       if (res.ok) {
         const data = await res.json();
-        cachedConfig = data.record || [];
+        cachedConfig = Array.isArray(data) ? data : [];
+        fs.writeFileSync(CONFIG_FILE, JSON.stringify(cachedConfig, null, 2), 'utf-8');
+        logWithTime('SYSTEM', 'Config synced from remote server successfully.', 'success');
         return cachedConfig;
+      } else {
+        logWithTime('SYSTEM', `Remote config fetch failed with status: ${res.status}`, 'warning');
       }
     } catch (e) {
-      logWithTime('SYSTEM', 'Failed to load config from JSONBin.io', 'error');
+      logWithTime('SYSTEM', 'Failed to connect to remote config server. Falling back to local.', 'error');
     }
+  }
+
+  if (!fs.existsSync(CONFIG_FILE)) {
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify([], null, 2), 'utf-8');
+    cachedConfig = [];
     return cachedConfig;
-  } else {
-    if (!fs.existsSync(CONFIG_FILE)) {
-      fs.writeFileSync(CONFIG_FILE, JSON.stringify([], null, 2), 'utf-8');
-      cachedConfig = [];
-      return cachedConfig;
-    }
-    try { 
-      cachedConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')); 
-      return cachedConfig;
-    } catch (e) { 
-      return []; 
-    }
+  }
+  try { 
+    cachedConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')); 
+    if (!Array.isArray(cachedConfig)) cachedConfig = [];
+    return cachedConfig;
+  } catch (e) { 
+    return []; 
   }
 }
 
 async function saveConfig(config) {
   cachedConfig = config;
-  const useCloud = JSONBIN_ID && JSONBIN_KEY;
-  if (useCloud) {
+  
+  // 1. 始终先保存到本地
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+
+  // 2. 如果设置了远程 URL，推送到远程服务器
+  if (CONFIG_URL) {
     try {
-      await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_ID}`, {
-        method: 'PUT',
+      const res = await fetch(CONFIG_URL, {
+        method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'X-Master-Key': JSONBIN_KEY 
+          'X-Secret': CONFIG_SECRET 
         },
         body: JSON.stringify(config)
       });
+      if (!res.ok) {
+        logWithTime('SYSTEM', `Failed to push config to remote (Status: ${res.status})`, 'error');
+      }
     } catch (e) {
-      logWithTime('SYSTEM', 'Failed to save config to JSONBin.io', 'error');
+      logWithTime('SYSTEM', 'Failed to reach remote config server to save.', 'error');
     }
-  } else {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
   }
 }
 
@@ -496,6 +505,17 @@ app.delete('/api/servers/:id', requireAuth, async (req, res) => {
   res.json({ success: true });
 });
 
+app.get('/api/export', requireAuth, async (req, res) => {
+  try {
+    const configs = await loadConfig();
+    res.setHeader('Content-disposition', 'attachment; filename=server_config.json');
+    res.setHeader('Content-type', 'application/json');
+    res.status(200).send(JSON.stringify(configs, null, 2));
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to export configuration' });
+  }
+});
+
 app.get('/', (req, res) => {
   const isAuthenticated = req.cookies.auth_token === AUTH_TOKEN;
   const html = `
@@ -552,7 +572,7 @@ app.get('/', (req, res) => {
 
         .header h1 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: 0.5px; }
         .spacer { flex: 1; }
-        .btn-text { background: transparent; border: none; color: var(--text-sub); cursor: pointer; font-size: 13px; font-weight: 500; }
+        .btn-text { background: transparent; border: none; color: var(--text-sub); cursor: pointer; font-size: 13px; font-weight: 500; transition: color 0.2s; }
         .btn-text:hover { color: var(--text-main); }
 
         .layout { display: flex; flex: 1; overflow: hidden; padding: 20px; gap: 20px; max-width: 1500px; margin: 0 auto; width: 100%; box-sizing: border-box; }
@@ -660,6 +680,7 @@ app.get('/', (req, res) => {
         <div class="mac-controls"><div class="mac-btn mac-close"></div><div class="mac-btn mac-min"></div><div class="mac-btn mac-max"></div></div>
         <h1>Session Manager Pro</h1>
         <div class="spacer"></div>
+        <button class="btn-text" onclick="exportJSON()" style="margin-right: 16px;">📥 Export JSON</button>
         <button class="btn-text" onclick="logout()">Lock Session</button>
     </div>
 
@@ -825,6 +846,10 @@ app.get('/', (req, res) => {
             await fetch(\`/api/servers/\${id}\`, { method: 'DELETE' });
             if(document.getElementById('edit-id').value === id) resetForm();
             fetchStatus();
+        }
+
+        function exportJSON() {
+            window.location.href = '/api/export';
         }
 
         async function logout() {
