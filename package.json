@@ -8,6 +8,7 @@
   "dependencies": {
     "cookie-parser": "^1.4.6",
     "express": "^4.18.2",
+    "minecraft-data": "^3.0.0",
     "mineflayer": "^4.35.0",
     "mineflayer-pathfinder": "^2.4.5",
     "vec3": "^0.1.10"
